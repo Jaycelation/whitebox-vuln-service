@@ -1,0 +1,11 @@
+.git
+.mcp.json
+.venv
+__pycache__
+*.py[cod]
+data
+.env
+*.zip
+dist
+build
+*.egg-info

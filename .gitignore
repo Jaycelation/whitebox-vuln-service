@@ -1,0 +1,15 @@
+.env
+.mcp.json
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+scanner-data/
+data/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

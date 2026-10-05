@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "whitebox-scanner": {
+      "command": "whitebox-mcp",
+      "args": [],
+      "env": {
+        "WHITEBOX_API_URL": "http://127.0.0.1:8000",
+        "WHITEBOX_ALLOWED_ROOTS": "${CLAUDE_PROJECT_DIR:-.}",
+        "WHITEBOX_API_KEY": "${WHITEBOX_API_KEY:-}"
+      }
+    }
+  }
+}
