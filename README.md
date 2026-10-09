@@ -173,6 +173,28 @@ Limits:
 
 The test fixtures in `tests/fixtures/dataflow/` hold 29 expected flows across the seven languages, including two-level chains, source wrappers, methods, and sanitized or constant inputs that must not be reported. The suite requires an exact match. On intentionally vulnerable open-source apps it found, for example, DVWA's command injection, SQL injection, and open redirect at low/medium/high, NodeGoat's `eval` injection and SSRF, and pygoat's `pickle` deserialization, `eval`, raw SQL, and SSRF.
 
+### Evidence levels and CVSS
+
+A finding gets a CVSS 3.1 score only when there is concrete evidence that it is real in this code. A vulnerable version number is not enough. Each finding has `evidence.level`, the `evidence.items` explaining it, and `cvss` (null when not scored).
+
+| Level | Meaning | CVSS |
+| --- | --- | --- |
+| `confirmed` | A reviewer confirmed it through triage. | Yes |
+| `reachable` | A concrete path exists: a `dataflow` trace from request input to the sink, or a dependency whose advisory names the vulnerable function and the project calls it. | Yes |
+| `present` | The code or package is there but no path was shown: an imported vulnerable package whose advisory does not name the function, a Semgrep pattern match, a secret, or a misconfiguration. | No; the advisory's own score is shown for reference |
+| `unverified` | Only the version matched (the project never imports the package), or the false-positive check flagged it. | No |
+| `false_positive` | A reviewer marked it as a false positive. | No |
+
+Scores are computed with the CVSS 3.1 base formula, and `cvss.reasons` explains each adjustment.
+
+- **Traced code flows** start from a class vector for an unauthenticated network attacker: 9.8 for command, code, and SQL injection and deserialization, 7.5 for path traversal (file read), 7.2 for SSRF, and 6.1 for XSS and open redirect. When the entry point's function, or a decorator or annotation directly above it, checks login, `PR:N` becomes `PR:L`. Examples are `@login_required`, `request.user.is_authenticated`, `@PreAuthorize`, `[Authorize]`, and `passport.authenticate`. Commented-out checks do not count.
+- **Reachable dependencies** use the advisory's vector from Trivy (NVD/GHSA) or OSV.
+- **Reviewers** can set their own vector when confirming, for example `PR:H` for an admin-only endpoint. Pass `cvss_vector` to `PATCH /api/scans/{id}/findings/{finding_id}` or to the MCP `whitebox_triage_finding` tool. The vector is stored with the decision and applied to later scans.
+
+`GET /api/scans/{id}/report?evidence=confirmed,reachable` lists only evidence-backed findings. The summary counts findings by evidence level and by CVSS rating, and the dashboard sorts scored findings first. In SARIF, only scored findings carry `security-severity`, so GitHub code scanning ranks by evidence-backed scores.
+
+A static trace is strong evidence but not a working exploit: validation in an `if` statement, configuration, and deployment can still make it unexploitable. Most advisories do not name the vulnerable function, so most dependency findings stop at `present`. On pygoat, 11 of 716 findings were scored. Each was a traced flow and a known vulnerability of the app, and views that check login scored 8.8 instead of 9.8. 222 dependency findings were `unverified` because the package is never imported.
+
 ### False-positive checks
 
 While the source is still extracted, each finding gets `fp_check`: a `verdict`, the `reasons` for it, and `duplicate_of` when it repeats another finding. The check only advises. It never changes `triage_status` and never hides a finding.

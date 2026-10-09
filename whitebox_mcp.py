@@ -268,19 +268,24 @@ async def whitebox_get_report(
     limit: int = 25,
     fp_verdict: str | None = None,
     triage_status: str | None = None,
+    evidence: str | None = None,
 ) -> dict[str, Any]:
     """Get a scan summary and a page of findings; secret values are redacted by the service.
 
     Each finding has fp_check (verdict likely_false_positive, duplicate, or needs_review,
     with reasons) and triage_status. Pass fp_verdict="needs_review" to skip likely false
     positives and duplicates, or comma-separate several values.
+
+    Each finding also has evidence.level (confirmed, reachable, present, unverified,
+    false_positive) with the reasons, and cvss only when the evidence shows the issue
+    is real (confirmed or reachable). Pass evidence="confirmed,reachable" for those.
     """
     if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
         raise ValueError("Invalid scan ID")
     if offset < 0:
         raise ValueError("offset must be zero or greater")
     page_size = min(max(limit, 1), 50)
-    params = {key: value for key, value in (("fp_verdict", fp_verdict), ("triage_status", triage_status)) if value}
+    params = {key: value for key, value in (("fp_verdict", fp_verdict), ("triage_status", triage_status), ("evidence", evidence)) if value}
     status, report = await asyncio.gather(
         _api_request("GET", f"/api/scans/{scan_id}"),
         _api_request("GET", f"/api/scans/{scan_id}/report", params=params),
@@ -312,6 +317,7 @@ async def whitebox_triage_finding(
     finding_id: str,
     status: str,
     note: str = "",
+    cvss_vector: str | None = None,
 ) -> dict[str, Any]:
     """Record a triage decision for a finding after checking it in the source.
 
@@ -319,6 +325,10 @@ async def whitebox_triage_finding(
     (needs_review clears an earlier decision). Explain the evidence in note, for
     example why the input is not attacker-controlled. The decision also applies to
     duplicates of the finding and to the same finding in later scans of the project.
+
+    Confirming a finding scores it with CVSS 3.1. Pass cvss_vector (for example
+    CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H) when the context differs from the
+    default, such as an admin-only endpoint.
     """
     if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
         raise ValueError("Invalid scan ID")
@@ -329,7 +339,7 @@ async def whitebox_triage_finding(
     return await _api_request(
         "PATCH",
         f"/api/scans/{scan_id}/findings/{finding_id}",
-        json={"status": status, "note": note[:2000]},
+        json={"status": status, "note": note[:2000], **({"cvss_vector": cvss_vector} if cvss_vector else {})},
     )
 
 

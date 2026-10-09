@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import whitebox_dataflow
+import whitebox_evidence
 
 
 def positive_int_setting(name: str, default: int) -> int:
@@ -186,9 +187,14 @@ def initialize_storage() -> None:
                 updated_at TEXT NOT NULL,
                 scan_id TEXT,
                 finding_id TEXT,
+                cvss_vector TEXT,
                 PRIMARY KEY (project, match_key)
             )"""
         )
+        decision_columns = {column["name"] for column in db.execute("PRAGMA table_info(triage_decisions)")}
+        if "cvss_vector" not in decision_columns:
+            with suppress(sqlite3.OperationalError):
+                db.execute("ALTER TABLE triage_decisions ADD COLUMN cvss_vector TEXT")
 
 
 def job_dir(scan_id: str) -> Path:
@@ -482,8 +488,7 @@ def parse_trivy(data: Any, source_root: Path) -> list[dict[str, Any]]:
             message = f"{package} {installed} is affected."
             if fixed:
                 message += f" Fixed version: {fixed}."
-            findings.append(
-                make_finding(
+            finding = make_finding(
                     tool="trivy",
                     category="dependency",
                     severity=item.get("Severity"),
@@ -498,7 +503,9 @@ def parse_trivy(data: Any, source_root: Path) -> list[dict[str, Any]]:
                     aliases=item.get("VendorIDs"),
                     source_root=source_root,
                 )
-            )
+            finding["ecosystem"] = clean_text(result.get("Type"), 40) or None
+            finding["advisory_cvss"] = trivy_advisory_cvss(item)
+            findings.append(finding)
         for item in result.get("Misconfigurations") or []:
             cause = item.get("CauseMetadata") or {}
             findings.append(
@@ -533,6 +540,35 @@ def parse_trivy(data: Any, source_root: Path) -> list[dict[str, Any]]:
                 )
             )
     return findings
+
+
+def trivy_advisory_cvss(item: dict[str, Any]) -> dict[str, Any] | None:
+    sources = item.get("CVSS") or {}
+    preferred = [item.get("SeveritySource"), "ghsa", "nvd", "redhat"]
+    for name in [name for name in preferred if name] + [name for name in sources if name not in preferred]:
+        vector = (sources.get(name) or {}).get("V3Vector")
+        if isinstance(vector, str) and whitebox_evidence.valid_vector(vector):
+            return {"vector": vector, "score": (sources[name] or {}).get("V3Score"), "source": name}
+    return None
+
+
+def osv_advisory_cvss(vulnerability: dict[str, Any]) -> dict[str, Any] | None:
+    for entry in vulnerability.get("severity") or []:
+        vector = entry.get("score") if isinstance(entry, dict) else None
+        if isinstance(vector, str) and whitebox_evidence.valid_vector(vector):
+            return {"vector": vector, "score": whitebox_evidence.cvss31_base_score(vector), "source": "osv"}
+    return None
+
+
+def osv_affected_symbols(vulnerability: dict[str, Any]) -> list[str]:
+    """Vulnerable functions named by the advisory (Go advisories list them)."""
+    symbols: list[str] = []
+    for affected in vulnerability.get("affected") or []:
+        specific = (affected or {}).get("ecosystem_specific") or {}
+        for imported in specific.get("imports") or []:
+            symbols.extend(str(symbol) for symbol in imported.get("symbols") or [])
+        symbols.extend(str(symbol) for symbol in specific.get("affected_functions") or [])
+    return sorted({clean_text(symbol, 200) for symbol in symbols if symbol})[:50]
 
 
 def osv_severity(vulnerability: dict[str, Any]) -> str:
@@ -586,8 +622,7 @@ def parse_osv(data: Any, source_root: Path) -> list[dict[str, Any]]:
                 if fixed:
                     message += " Fixed version(s): " + ", ".join(fixed) + "."
                 refs = [ref.get("url") for ref in vulnerability.get("references") or [] if isinstance(ref, dict)]
-                findings.append(
-                    make_finding(
+                finding = make_finding(
                         tool="osv-scanner",
                         category="dependency",
                         severity=osv_severity(vulnerability),
@@ -601,7 +636,10 @@ def parse_osv(data: Any, source_root: Path) -> list[dict[str, Any]]:
                         aliases=aliases,
                         source_root=source_root,
                     )
-                )
+                finding["ecosystem"] = clean_text(package.get("ecosystem"), 40) or None
+                finding["advisory_cvss"] = osv_advisory_cvss(vulnerability)
+                finding["affected_symbols"] = osv_affected_symbols(vulnerability)
+                findings.append(finding)
     return findings
 
 
@@ -1038,6 +1076,7 @@ def apply_triage_decisions(project: str, findings: list[dict[str, Any]]) -> None
             finding["triage_note"] = decision["note"]
             finding["triage_updated_at"] = decision["updated_at"]
             finding["triage_source"] = "earlier_scan"
+            finding["triage_cvss_vector"] = decision["cvss_vector"]
 
 
 async def process_scan(scan_id: str) -> None:
@@ -1072,6 +1111,7 @@ async def process_scan(scan_id: str) -> None:
         # Runs before cleanup because some checks read the finding's source line.
         await complete_thread_work(check_false_positives, findings, source_root)
         apply_triage_decisions(row["name"], findings)
+        await complete_thread_work(whitebox_evidence.assess, findings, source_root)
         report = {
             "scan_id": scan_id,
             "created_at": row["created_at"],
@@ -1083,6 +1123,7 @@ async def process_scan(scan_id: str) -> None:
         }
         report["summary"]["findings_truncated"] = truncated
         report["summary"].update(triage_summary(findings))
+        report["summary"].update(whitebox_evidence.summary(findings))
         report_path = directory / "report.json"
         temporary_report = directory / "report.json.tmp"
         temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
@@ -1493,6 +1534,7 @@ def filter_findings(
     path_contains: str | None,
     triage_status: set[str] | None = None,
     fp_verdict: set[str] | None = None,
+    evidence: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     needle = path_contains.lower() if path_contains else None
     selected = []
@@ -1500,6 +1542,8 @@ def filter_findings(
         if triage_status is not None and finding.get("triage_status", "needs_review") not in triage_status:
             continue
         if fp_verdict is not None and (finding.get("fp_check") or {}).get("verdict", "needs_review") not in fp_verdict:
+            continue
+        if evidence is not None and (finding.get("evidence") or {}).get("level", "present") not in evidence:
             continue
         if severity is not None and finding.get("severity") not in severity:
             continue
@@ -1570,6 +1614,8 @@ def findings_to_sarif(scan_id: str, report: dict[str, Any], findings: list[dict[
                 "confidence": finding.get("confidence"),
                 "triage_status": finding.get("triage_status"),
                 "fp_verdict": (finding.get("fp_check") or {}).get("verdict"),
+                "evidence": (finding.get("evidence") or {}).get("level"),
+                **({"cvss_vector": finding["cvss"]["vector"], "security-severity": str(finding["cvss"]["score"])} if finding.get("cvss") else {}),
                 "duplicate_of": (finding.get("fp_check") or {}).get("duplicate_of"),
             },
         }
@@ -1592,6 +1638,14 @@ def findings_to_sarif(scan_id: str, report: dict[str, Any], findings: list[dict[
         run["results"].append(result)
     for run in runs.values():
         run.pop("_rule_index", None)
+        # GitHub ranks alerts by the rule's security-severity; use the highest evidence-backed score.
+        for result in run["results"]:
+            value = result["properties"].get("security-severity")
+            if value is not None:
+                rule = run["tool"]["driver"]["rules"][result["ruleIndex"]]
+                current = rule["properties"].get("security-severity")
+                if current is None or float(value) > float(current):
+                    rule["properties"]["security-severity"] = value
     return {
         "version": "2.1.0",
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -1608,6 +1662,7 @@ def get_report(
     path_contains: str | None = None,
     triage_status: str | None = None,
     fp_verdict: str | None = None,
+    evidence: str | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -1618,7 +1673,8 @@ def get_report(
     category_filter = parse_filter_values(category, CATEGORIES, "category")
     triage_filter = parse_filter_values(triage_status, TRIAGE_STATUSES, "triage_status")
     verdict_filter = parse_filter_values(fp_verdict, FP_VERDICTS, "fp_verdict")
-    filters = (severity_filter, tool_filter, category_filter, path_contains, triage_filter, verdict_filter)
+    evidence_filter = parse_filter_values(evidence, whitebox_evidence.EVIDENCE_LEVELS, "evidence")
+    filters = (severity_filter, tool_filter, category_filter, path_contains, triage_filter, verdict_filter, evidence_filter)
     if any(value is not None for value in filters):
         findings = filter_findings(
             findings,
@@ -1628,6 +1684,7 @@ def get_report(
             path_contains=clean_text(path_contains, 1000) if path_contains else None,
             triage_status=triage_filter,
             fp_verdict=verdict_filter,
+            evidence=evidence_filter,
         )
     matched = len(findings)
     offset = max(0, offset)
@@ -1647,6 +1704,7 @@ def get_report(
             "path_contains": path_contains,
             "triage_status": triage_status,
             "fp_verdict": fp_verdict,
+            "evidence": evidence,
         },
     }
     return report
@@ -1655,6 +1713,7 @@ def get_report(
 class TriageUpdate(BaseModel):
     status: str = Field(description="One of: " + ", ".join(TRIAGE_STATUSES))
     note: str = Field("", max_length=2000, description="Why the finding has this status")
+    cvss_vector: str | None = Field(None, description="Optional CVSS 3.1 base vector set by the reviewer, e.g. CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
 
 
 REPORT_WRITE_LOCK = threading.Lock()
@@ -1668,6 +1727,9 @@ def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[
     if not re.fullmatch(r"[0-9a-f]{24}", finding_id):
         raise HTTPException(status_code=404, detail="Finding not found")
     note = clean_text(update.note, 2000)
+    vector = (update.cvss_vector or "").strip() or None
+    if vector and not whitebox_evidence.valid_vector(vector):
+        raise HTTPException(status_code=422, detail="cvss_vector must be a CVSS 3.x base vector like CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
     with REPORT_WRITE_LOCK:
         row, report = load_report(scan_id)
         findings = report.get("findings") or []
@@ -1689,17 +1751,20 @@ def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[
                     db.execute("DELETE FROM triage_decisions WHERE project = ? AND match_key = ?", (row["name"], key))
                 else:
                     db.execute(
-                        "INSERT INTO triage_decisions (project, match_key, status, note, updated_at, scan_id, finding_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project, match_key) DO UPDATE SET "
+                        "INSERT INTO triage_decisions (project, match_key, status, note, updated_at, scan_id, finding_id, cvss_vector) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project, match_key) DO UPDATE SET "
                         "status = excluded.status, note = excluded.note, updated_at = excluded.updated_at, "
-                        "scan_id = excluded.scan_id, finding_id = excluded.finding_id",
-                        (row["name"], key, status, note, now, scan_id, finding["id"]),
+                        "scan_id = excluded.scan_id, finding_id = excluded.finding_id, cvss_vector = excluded.cvss_vector",
+                        (row["name"], key, status, note, now, scan_id, finding["id"], vector),
                     )
                 finding["triage_status"] = status
                 finding["triage_note"] = note or None
                 finding["triage_updated_at"] = now
                 finding["triage_source"] = "manual"
+                finding["triage_cvss_vector"] = vector
+                whitebox_evidence.apply_triage(finding)
         report.setdefault("summary", {}).update(triage_summary(findings))
+        report["summary"].update(whitebox_evidence.summary(findings))
         directory = job_dir(scan_id)
         temporary_report = directory / "report.json.tmp"
         temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")

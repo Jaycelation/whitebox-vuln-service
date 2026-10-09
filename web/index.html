@@ -118,6 +118,7 @@
               <label class="search-wrap"><span>⌕</span><input id="finding-search" type="search" placeholder="Tìm title, file, rule ID..." aria-label="Tìm findings"></label>
               <label class="select-wrap">Severity <select id="severity-filter"><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option><option value="unknown">Unknown</option></select></label>
               <label class="select-wrap">Scanner <select id="tool-filter"><option value="all">All scanners</option></select></label>
+              <label class="select-wrap">Bằng chứng <select id="evidence-filter"><option value="all">Tất cả</option><option value="scored">Có CVSS (đã chứng minh)</option><option value="confirmed">Đã xác nhận</option><option value="reachable">Có đường khai thác</option><option value="present">Có trong code</option><option value="unverified">Chỉ khớp version / nghi FP</option><option value="false_positive">False positive</option></select></label>
             </div>
             <div class="table-wrap"><table><thead><tr><th>SEVERITY</th><th>FINDING</th><th>LOCATION</th><th>SCANNER</th><th></th></tr></thead><tbody id="findings-body"></tbody></table></div>
             <div id="no-findings" class="no-findings hidden">Không có finding khớp bộ lọc.</div>

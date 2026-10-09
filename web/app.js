@@ -3,6 +3,12 @@
 const $ = (id) => document.getElementById(id);
 const severityOrder = ["critical", "high", "medium", "low", "info", "unknown"];
 const severityRank = Object.fromEntries(severityOrder.map((name, index) => [name, index]));
+const evidenceOrder = ["confirmed", "reachable", "present", "unverified", "false_positive"];
+const evidenceLabels = {
+  confirmed: "Đã xác nhận", reachable: "Có đường khai thác", present: "Có trong code",
+  unverified: "Chưa chứng minh", false_positive: "False positive",
+};
+function evidenceLevel(finding) { return finding.evidence?.level || "present"; }
 const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false, unlocked: false };
 
 function node(tag, className, content) {
@@ -248,13 +254,19 @@ function filteredFindings() {
   const findings = Array.isArray(state.report?.findings) ? state.report.findings : [];
   const severity = $("severity-filter").value;
   const tool = $("tool-filter").value;
+  const evidence = $("evidence-filter").value;
   const query = $("finding-search").value.trim().toLocaleLowerCase();
   return findings.filter((item) => {
     if (severity !== "all" && item.severity !== severity) return false;
     if (tool !== "all" && item.tool !== tool) return false;
+    if (evidence === "scored" && !item.cvss) return false;
+    if (!["all", "scored"].includes(evidence) && evidenceLevel(item) !== evidence) return false;
     if (!query) return true;
     return [item.title, item.message, item.path, item.rule_id].some((value) => String(value || "").toLocaleLowerCase().includes(query));
-  }).sort((a, b) => (severityRank[a.severity] ?? 6) - (severityRank[b.severity] ?? 6) || String(a.path || "").localeCompare(String(b.path || "")));
+  }).sort((a, b) => (b.cvss?.score ?? -1) - (a.cvss?.score ?? -1)
+    || evidenceOrder.indexOf(evidenceLevel(a)) - evidenceOrder.indexOf(evidenceLevel(b))
+    || (severityRank[a.severity] ?? 6) - (severityRank[b.severity] ?? 6)
+    || String(a.path || "").localeCompare(String(b.path || "")));
 }
 function renderFindings() {
   const findings = filteredFindings();
@@ -266,8 +278,12 @@ function renderFindings() {
     row.setAttribute("aria-label", `Xem finding: ${finding.title || "Potential issue"}`);
     const severity = node("td");
     severity.append(node("span", `severity-badge ${severityOrder.includes(finding.severity) ? finding.severity : "unknown"}`, finding.severity || "unknown"));
+    if (finding.cvss) severity.append(node("span", `cvss-badge ${finding.cvss.rating}`, `CVSS ${finding.cvss.score.toFixed(1)}`));
     const description = node("td");
-    description.append(node("span", "finding-title", finding.title || "Potential issue"), node("span", "finding-rule", finding.rule_id || finding.category || ""));
+    const level = evidenceLevel(finding);
+    const rule = node("span", "finding-rule", finding.rule_id || finding.category || "");
+    rule.prepend(node("span", `evidence-chip ${level}`, evidenceLabels[level] || level));
+    description.append(node("span", "finding-title", finding.title || "Potential issue"), rule);
     const locationCell = node("td");
     locationCell.append(node("span", "location", `${finding.path || "Unknown file"}${finding.line ? `:${finding.line}` : ""}`));
     const toolCell = node("td", "tool-name", finding.tool || "—");
@@ -311,8 +327,26 @@ function showDetail(finding) {
     section.append(list);
     content.append(section);
   } else {
-    detailSection(content, "EVIDENCE", finding.message || finding.title);
+    detailSection(content, "DETAILS", finding.message || finding.title);
   }
+  const level = evidenceLevel(finding);
+  const evidenceBox = node("section", "detail-section");
+  evidenceBox.append(node("h3", "", `BẰNG CHỨNG · ${(evidenceLabels[level] || level).toUpperCase()}`));
+  const evidenceList = node("ul", "evidence-list");
+  for (const item of finding.evidence?.items || []) evidenceList.append(node("li", "", item));
+  evidenceBox.append(evidenceList);
+  if (finding.cvss) {
+    const scoreLine = node("p", "cvss-line");
+    scoreLine.append(node("span", `cvss-badge ${finding.cvss.rating}`, `CVSS ${finding.cvss.version} · ${finding.cvss.score.toFixed(1)} ${finding.cvss.rating}`), node("code", "cvss-vector", finding.cvss.vector));
+    evidenceBox.append(scoreLine);
+    const reasons = node("ul", "evidence-list");
+    for (const reason of finding.cvss.reasons || []) reasons.append(node("li", "", reason));
+    evidenceBox.append(reasons);
+  } else {
+    const advisory = finding.advisory_cvss?.vector ? ` Điểm của advisory (chỉ tham khảo): ${finding.advisory_cvss.score ?? ""} — ${finding.advisory_cvss.vector}.` : "";
+    evidenceBox.append(node("p", "cvss-none", `Không chấm CVSS: chưa có bằng chứng cho thấy lỗi khai thác được trong code này.${advisory}`));
+  }
+  content.append(evidenceBox);
   const check = finding.fp_check;
   if (check && check.verdict && check.verdict !== "needs_review") {
     const reasons = (check.reasons || []).join(" ");
@@ -361,6 +395,7 @@ $("refresh-scans").addEventListener("click", () => loadScans());
 $("finding-search").addEventListener("input", () => { state.shown = 40; renderFindings(); });
 $("severity-filter").addEventListener("change", () => { state.shown = 40; renderFindings(); });
 $("tool-filter").addEventListener("change", () => { state.shown = 40; renderFindings(); });
+$("evidence-filter").addEventListener("change", () => { state.shown = 40; renderFindings(); });
 $("show-more").addEventListener("click", () => { state.shown += 40; renderFindings(); });
 document.querySelectorAll(".metric-card").forEach((button) => button.addEventListener("click", () => {
   $("severity-filter").value = button.dataset.severity;
