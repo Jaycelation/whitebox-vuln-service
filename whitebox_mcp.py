@@ -265,16 +265,24 @@ async def whitebox_get_report(
     scan_id: str,
     offset: int = 0,
     limit: int = 25,
+    fp_verdict: str | None = None,
+    triage_status: str | None = None,
 ) -> dict[str, Any]:
-    """Get a scan summary and a page of findings; secret values are redacted by the service."""
+    """Get a scan summary and a page of findings; secret values are redacted by the service.
+
+    Each finding has fp_check (verdict likely_false_positive, duplicate, or needs_review,
+    with reasons) and triage_status. Pass fp_verdict="needs_review" to skip likely false
+    positives and duplicates, or comma-separate several values.
+    """
     if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
         raise ValueError("Invalid scan ID")
     if offset < 0:
         raise ValueError("offset must be zero or greater")
     page_size = min(max(limit, 1), 50)
+    params = {key: value for key, value in (("fp_verdict", fp_verdict), ("triage_status", triage_status)) if value}
     status, report = await asyncio.gather(
         _api_request("GET", f"/api/scans/{scan_id}"),
-        _api_request("GET", f"/api/scans/{scan_id}/report"),
+        _api_request("GET", f"/api/scans/{scan_id}/report", params=params),
     )
     findings = report.get("findings", []) if isinstance(report, dict) else []
     total = len(findings)
@@ -292,6 +300,36 @@ async def whitebox_get_report(
             "next_offset": offset + len(page) if offset + len(page) < total else None,
         },
     }
+
+
+TRIAGE_STATUSES = frozenset({"needs_review", "confirmed", "false_positive", "accepted_risk", "fixed"})
+
+
+@mcp.tool()
+async def whitebox_triage_finding(
+    scan_id: str,
+    finding_id: str,
+    status: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """Record a triage decision for a finding after checking it in the source.
+
+    status is one of: false_positive, confirmed, accepted_risk, fixed, needs_review
+    (needs_review clears an earlier decision). Explain the evidence in note, for
+    example why the input is not attacker-controlled. The decision also applies to
+    duplicates of the finding and to the same finding in later scans of the project.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
+        raise ValueError("Invalid scan ID")
+    if not re.fullmatch(r"[0-9a-f]{24}", finding_id):
+        raise ValueError("Invalid finding ID")
+    if status not in TRIAGE_STATUSES:
+        raise ValueError("status must be one of: " + ", ".join(sorted(TRIAGE_STATUSES)))
+    return await _api_request(
+        "PATCH",
+        f"/api/scans/{scan_id}/findings/{finding_id}",
+        json={"status": status, "note": note[:2000]},
+    )
 
 
 def main() -> None:
