@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 
 def positive_int_setting(name: str, default: int) -> int:
@@ -76,12 +76,38 @@ def scanner_process_limits(raw: str) -> dict[str, int]:
 
 
 SCANNER_PROCESS_LIMITS = scanner_process_limits(os.getenv("SCANNER_PROCESS_LIMITS", ""))
+SCAN_STATUSES = ("queued", "running", "completed", "partial", "failed")
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secret", "dependency", "misconfiguration")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 RECOVERING = False
 SCANNER_SLOTS: ScannerSlots | None = None
 LOGGER = logging.getLogger("whitebox")
+
+
+class Metrics:
+    """Process-local counters for GET /api/metrics. They reset when the service restarts."""
+
+    def __init__(self) -> None:
+        self.active_scans = 0
+        self.active_scanner_processes = 0
+        self.scan_durations: dict[str, list[float]] = {}
+        self.scanner_runs: dict[tuple[str, str], int] = {}
+        self.scanner_durations: dict[str, list[float]] = {}
+
+    def observe_scan(self, status: str, seconds: float) -> None:
+        total = self.scan_durations.setdefault(status, [0.0, 0])
+        total[0] += seconds
+        total[1] += 1
+
+    def observe_scanner(self, name: str, status: str, seconds: float) -> None:
+        self.scanner_runs[(name, status)] = self.scanner_runs.get((name, status), 0) + 1
+        total = self.scanner_durations.setdefault(name, [0.0, 0])
+        total[0] += seconds
+        total[1] += 1
+
+
+METRICS = Metrics()
 
 
 async def complete_thread_work(function: Any, *args: Any) -> Any:
@@ -716,7 +742,13 @@ def scanner_slots() -> ScannerSlots:
 
 async def run_scanner_in_slot(name: str, source_root: Path, work_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     async with scanner_slots().acquire(name):
-        return await run_scanner(name, source_root, work_dir)
+        METRICS.active_scanner_processes += 1
+        try:
+            scanner_result, findings = await run_scanner(name, source_root, work_dir)
+        finally:
+            METRICS.active_scanner_processes -= 1
+    METRICS.observe_scanner(name, str(scanner_result.get("status", "unknown")), float(scanner_result.get("duration_seconds") or 0))
+    return scanner_result, findings
 
 
 async def run_scanners(names: list[str], source_root: Path, work_dir: Path) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
@@ -761,6 +793,8 @@ async def process_scan(scan_id: str) -> None:
     extract_dir = directory / "source"
     update_scan(scan_id, status="running", updated_at=utc_now(), error=None)
     interrupted = False
+    started = time.monotonic()
+    METRICS.active_scans += 1
     try:
         source_root = await complete_thread_work(extract_zip, upload_path, extract_dir)
         scanners: list[dict[str, Any]] = []
@@ -808,6 +842,7 @@ async def process_scan(scan_id: str) -> None:
             summary_json=json.dumps(report["summary"]),
             scanner_results_json=json.dumps(scanners),
         )
+        METRICS.observe_scan(status, time.monotonic() - started)
     except asyncio.CancelledError:
         interrupted = True
         update_scan(scan_id, status="queued", updated_at=utc_now(), error="Service restarted while this scan was running.")
@@ -815,7 +850,9 @@ async def process_scan(scan_id: str) -> None:
     except Exception as exc:
         message = "Source archive could not be extracted." if isinstance(exc, (ValueError, zipfile.BadZipFile)) else "Scan could not be completed."
         update_scan(scan_id, status="failed", updated_at=utc_now(), finished_at=utc_now(), error=message)
+        METRICS.observe_scan("failed", time.monotonic() - started)
     finally:
+        METRICS.active_scans -= 1
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(extract_dir, ignore_errors=True)
         if not interrupted:
@@ -1003,6 +1040,76 @@ def home() -> dict[str, str]:
 @api.get("/scanners")
 def get_scanners() -> dict[str, Any]:
     return {"scanners": scanner_inventory(), "default": list(DEFAULT_SCANNERS)}
+
+
+def count_scans_by_status() -> dict[str, int]:
+    counts = dict.fromkeys(SCAN_STATUSES, 0)
+    with connect_db() as db:
+        for row in db.execute("SELECT status, COUNT(*) AS total FROM scans GROUP BY status"):
+            counts[row["status"]] = row["total"]
+    return counts
+
+
+def prometheus_label(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_metrics(scans_by_status: dict[str, int]) -> str:
+    lines: list[str] = []
+
+    def family(name: str, kind: str, help_text: str, samples: list[tuple[str, dict[str, str], float]]) -> None:
+        lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} {kind}"))
+        for suffix, labels, value in samples:
+            label_text = ",".join(f'{key}="{prometheus_label(label)}"' for key, label in labels.items())
+            number = str(value) if isinstance(value, int) else repr(round(float(value), 6))
+            lines.append(f"{name}{suffix}{{{label_text}}} {number}" if labels else f"{name}{suffix} {number}")
+
+    family("whitebox_queue_depth", "gauge", "Scans waiting in the queue.", [("", {}, JOB_QUEUE.qsize())])
+    family("whitebox_queue_capacity", "gauge", "Scans the queue holds before uploads get 503.", [("", {}, JOB_QUEUE.maxsize)])
+    family("whitebox_recovering", "gauge", "1 while recovered scans are still being queued after a restart.", [("", {}, int(RECOVERING))])
+    family(
+        "whitebox_scans", "gauge", "Stored scans by status.",
+        [("", {"status": status}, total) for status, total in sorted(scans_by_status.items())],
+    )
+    family("whitebox_scan_workers", "gauge", "Scans this process can run at once (SCAN_CONCURRENCY).", [("", {}, SCAN_CONCURRENCY)])
+    family("whitebox_active_scans", "gauge", "Scans this process is running now.", [("", {}, METRICS.active_scans)])
+    family(
+        "whitebox_scanner_process_limit", "gauge", "Scanner processes allowed at once (MAX_SCANNER_PROCESSES).",
+        [("", {}, MAX_SCANNER_PROCESSES)],
+    )
+    family(
+        "whitebox_active_scanner_processes", "gauge", "Scanner processes this process is running now.",
+        [("", {}, METRICS.active_scanner_processes)],
+    )
+    scan_durations = {status: METRICS.scan_durations.get(status, [0.0, 0]) for status in ("completed", "partial", "failed")}
+    family(
+        "whitebox_scan_duration_seconds", "summary", "Time from scan start to finish since this process started.",
+        [
+            sample
+            for status, (seconds, count) in sorted(scan_durations.items())
+            for sample in (("_sum", {"status": status}, seconds), ("_count", {"status": status}, count))
+        ],
+    )
+    family(
+        "whitebox_scanner_runs_total", "counter", "Scanner runs by result since this process started.",
+        [("", {"scanner": name, "status": status}, total) for (name, status), total in sorted(METRICS.scanner_runs.items())],
+    )
+    family(
+        "whitebox_scanner_duration_seconds", "summary", "Scanner run time since this process started.",
+        [
+            sample
+            for name, (seconds, count) in sorted(METRICS.scanner_durations.items())
+            for sample in (("_sum", {"scanner": name}, seconds), ("_count", {"scanner": name}, count))
+        ],
+    )
+    return "\n".join(lines) + "\n"
+
+
+@api.get("/metrics", response_class=PlainTextResponse)
+async def get_metrics() -> PlainTextResponse:
+    scans_by_status = await asyncio.to_thread(count_scans_by_status)
+    # Render on the event loop so the counters are not read while scans update them.
+    return PlainTextResponse(render_metrics(scans_by_status), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @api.post("/scans", status_code=202)

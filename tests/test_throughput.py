@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import UploadFile
 
 import app as service
@@ -412,6 +414,108 @@ class ConcurrencyTests(ServiceTestCase):
                 result, _ = await service.run_scanner(name, source_root, work_dir)
                 self.assertEqual(result['status'], 'failed')
         self.assertEqual(directories, {'joern-scan': str(work_dir), 'semgrep': str(source_root)})
+
+
+SAMPLE_LINE = re.compile(
+    r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)'
+    r'(?P<labels>\{[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\.)*"(?:,[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\\n]|\\.)*")*\})?'
+    r' (?P<value>-?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)$'
+)
+
+
+class MetricsTests(ServiceTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(service, 'METRICS', service.Metrics())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def fetch(self, headers=None):
+        transport = httpx.ASGITransport(app=service.app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            return await client.get('/api/metrics', headers=headers or {})
+
+    def parse(self, text):
+        """Check the exposition format and return {name{labels}: value}."""
+        families, samples = {}, {}
+        for line in text.splitlines():
+            if line.startswith('# HELP '):
+                continue
+            if line.startswith('# TYPE '):
+                _, _, name, kind = line.split(' ')
+                self.assertIn(kind, ('gauge', 'counter', 'summary'))
+                families[name] = kind
+                continue
+            match = SAMPLE_LINE.match(line)
+            self.assertIsNotNone(match, line)
+            name = match['name']
+            family = re.sub(r'_(sum|count)$', '', name) if name not in families else name
+            self.assertIn(family, families, f'{name} has no TYPE line')
+            samples[name + (match['labels'] or '')] = float(match['value'])
+        return samples
+
+    async def test_metrics_require_the_api_key(self):
+        with patch.object(service, 'API_KEY', 'secret'):
+            self.assertEqual((await self.fetch()).status_code, 401)
+            response = await self.fetch({'Authorization': 'Bearer secret'})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers['content-type'].startswith('text/plain; version=0.0.4'))
+
+    async def test_metrics_report_queue_scans_and_scanner_runs(self):
+        self.seed('queued')
+        self.seed('failed')
+        scan_id = self.seed(scanners=['semgrep', 'trivy'])
+        results = [
+            ({'name': 'semgrep', 'status': 'completed', 'duration_seconds': 1.5}, []),
+            ({'name': 'trivy', 'status': 'timed_out', 'duration_seconds': 900.0}, []),
+        ]
+        with patch.object(service, 'run_scanner', new=AsyncMock(side_effect=results)):
+            await service.process_scan(scan_id)
+        service.JOB_QUEUE.put_nowait('a' * 32)
+        with patch.object(service, 'API_KEY', ''):
+            samples = self.parse((await self.fetch()).text)
+        expected = {
+            'whitebox_queue_depth': 1,
+            'whitebox_queue_capacity': 10,
+            'whitebox_recovering': 0,
+            'whitebox_scans{status="queued"}': 1,
+            'whitebox_scans{status="running"}': 0,
+            'whitebox_scans{status="partial"}': 1,
+            'whitebox_scans{status="failed"}': 1,
+            'whitebox_active_scans': 0,
+            'whitebox_active_scanner_processes': 0,
+            'whitebox_scan_duration_seconds_count{status="partial"}': 1,
+            'whitebox_scan_duration_seconds_count{status="completed"}': 0,
+            'whitebox_scanner_runs_total{scanner="semgrep",status="completed"}': 1,
+            'whitebox_scanner_runs_total{scanner="trivy",status="timed_out"}': 1,
+            'whitebox_scanner_duration_seconds_sum{scanner="trivy"}': 900.0,
+            'whitebox_scanner_duration_seconds_count{scanner="semgrep"}': 1,
+        }
+        self.assertEqual({key: samples.get(key) for key in expected}, expected)
+
+    async def test_metrics_count_active_scans_and_scanner_processes(self):
+        scan_id = self.seed(scanners=['gitleaks'])
+        running = asyncio.Event()
+
+        async def scanner(name, source_root, work_dir):
+            running.set()
+            await asyncio.Event().wait()
+
+        with patch.object(service, 'run_scanner', side_effect=scanner):
+            task = asyncio.create_task(service.process_scan(scan_id))
+            await asyncio.wait_for(running.wait(), timeout=5)
+            with patch.object(service, 'API_KEY', ''):
+                samples = self.parse((await self.fetch()).text)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(samples['whitebox_active_scans'], 1)
+        self.assertEqual(samples['whitebox_active_scanner_processes'], 1)
+        self.assertEqual(samples['whitebox_scans{status="running"}'], 1)
+        self.assertEqual((service.METRICS.active_scans, service.METRICS.active_scanner_processes), (0, 0))
+
+    def test_label_values_are_escaped(self):
+        self.assertEqual(service.prometheus_label('a"b\\c\nd'), 'a\\"b\\\\c\\nd')
 
 
 class SettingsTests(unittest.TestCase):

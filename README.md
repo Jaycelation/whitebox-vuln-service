@@ -138,6 +138,7 @@ Other endpoints:
 
 - `GET /api/scanners` lists installed scanners.
 - `GET /api/scans?limit=50` lists recent jobs.
+- `GET /api/metrics` returns Prometheus text-format metrics: queue depth, stored scans by status, active scans and scanner processes, and scan and scanner run counts and durations. It uses the same bearer token as the other `/api` endpoints. Counts and durations cover the running process and reset when the service restarts.
 - `DELETE /api/scans/{id}` removes a finished job and its report.
 - `GET /health` is an unauthenticated health check.
 
@@ -159,7 +160,7 @@ Larger recovery backlogs are fed into the queue in the background so the API can
 - The API accepts up to 20,000 ZIP entries by default. The MCP adapter defaults to 20,000 source files and checks the size of the finalized ZIP, including its directory metadata. If you customize these limits, keep `WHITEBOX_MAX_SOURCE_FILES` at or below the API's `MAX_ARCHIVE_ENTRIES`.
 - By default one scan runs at a time and runs its scanners one after another, with up to 10 queued jobs. `SCAN_CONCURRENCY` sets how many scans run at once, and `SCANNER_PARALLELISM` sets how many scanners one scan runs at once. `MAX_SCANNER_PROCESSES` caps scanner processes across all scans and defaults to the product of the two. Reports do not depend on these settings: scanners and findings keep the requested order.
 - `SCANNER_PROCESS_LIMITS` caps individual tools across all scans. It takes comma-separated `name=limit` overrides of the default `trivy=1,joern=1`; `0` removes a cap. Each Trivy process that finds its vulnerability database out of date downloads it into the shared cache, so concurrent Trivy runs repeat the download and write the same files. Joern is a memory-heavy JVM. Semgrep 1.179.0 was tested running concurrently with a shared home directory and has no cap by default.
-- More concurrency needs more CPU and memory. The Compose file limits the container to 2 CPUs and 6 GB (`CPU_LIMIT`, `MEMORY_LIMIT`); raise them along with these settings. Semgrep already uses two jobs per process, and `pids_limit` (512) counts threads as well as processes. Measure with your own repositories before raising limits.
+- More concurrency needs more CPU and memory. The Compose file limits the container to 2 CPUs and 6 GB (`CPU_LIMIT`, `MEMORY_LIMIT`); raise them along with these settings. Semgrep already uses two jobs per process, and `pids_limit` (512) counts threads as well as processes. Measure with your own repositories before raising limits; `GET /api/metrics` shows queue depth, active scanner processes, and scanner run times.
 - Run one Uvicorn worker per data directory, as configured in the Docker image. The queue is local to that process; multiple API workers or replicas sharing a data directory are not supported.
 - Each scanner has a 15-minute timeout by default.
 - ZIP traversal paths, duplicate paths, encrypted entries, and symlinks are rejected.
@@ -177,4 +178,4 @@ python -m pip install -r requirements.txt -e .
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, and stored scan summaries. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, and the metrics endpoint. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
