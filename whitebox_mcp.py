@@ -308,6 +308,20 @@ async def whitebox_get_report(
     }
 
 
+@mcp.tool()
+async def whitebox_verify_scan(scan_id: str) -> dict[str, Any]:
+    """Have Claude review the scan's evidence-backed (CVSS-scored) findings again.
+
+    The service sends the code stored with each finding to the Claude API, records
+    confirmed or false_positive verdicts as agent decisions (a person's decision is
+    never overridden), and returns counts. Requires VERIFY_WITH_CLAUDE=1 and an
+    Anthropic API key on the scanner service.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
+        raise ValueError("Invalid scan ID")
+    return await _api_request("POST", f"/api/scans/{scan_id}/verify")
+
+
 TRIAGE_STATUSES = frozenset({"needs_review", "confirmed", "false_positive", "accepted_risk", "fixed"})
 
 

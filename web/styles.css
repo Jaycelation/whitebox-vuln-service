@@ -1258,3 +1258,27 @@ html[data-theme="light"] .evidence-chip.confirmed { background: #dcf5ec; color: 
 html[data-theme="light"] .evidence-chip.reachable { background: #fde4e7; color: #b42336; }
 html[data-theme="light"] .evidence-chip.unverified, html[data-theme="light"] .evidence-chip.false_positive { background: transparent; color: #5a6b80; border-color: #dce5ef; }
 html[data-theme="light"] .cvss-none { color: #5a6b80; }
+
+/* Claude review and stored code. */
+.agent-chip { display: inline-block; margin-right: 7px; border-radius: 999px; padding: 1px 7px; font-size: 10px; font-weight: 700; background: #2a3547; color: #d3dceb; }
+.agent-chip.confirmed { background: #4c2838; color: #ff8d96; }
+.agent-chip.false_positive { background: #1b3d38; color: #62d8ad; }
+.agent-summary { font-size: 13px; line-height: 1.55; margin: 0 0 8px; }
+.agent-detail { font-size: 13px; line-height: 1.55; margin: 6px 0; }
+.agent-reasoning summary { cursor: pointer; font-size: 12px; color: #55dfd0; }
+.agent-reasoning p { font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.agent-meta { font-size: 11px; color: #7f94aa; margin: 8px 0 0; }
+.code-file { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: #8899ad; margin: 10px 0 4px; word-break: break-all; }
+.code-window { margin: 0; padding: 8px 0; border-radius: 6px; background: #0e1724; overflow-x: auto; font-size: 11.5px; line-height: 1.55; }
+.code-line { display: block; padding: 0 10px 0 0; white-space: pre; color: #c8d3e1; }
+.code-line.traced { background: #3a2a14; color: #ffd9a8; }
+.code-number { display: inline-block; width: 44px; padding-right: 10px; text-align: right; color: #5d7088; user-select: none; }
+html[data-theme="light"] .agent-chip { background: #e8edf3; color: #45566c; }
+html[data-theme="light"] .agent-chip.confirmed { background: #fde4e7; color: #b42336; }
+html[data-theme="light"] .agent-chip.false_positive { background: #dcf5ec; color: #11734f; }
+html[data-theme="light"] .agent-reasoning summary { color: #0f8f81; }
+html[data-theme="light"] .agent-meta, html[data-theme="light"] .code-file { color: #5a6b80; }
+html[data-theme="light"] .code-window { background: #f4f7fb; border: 1px solid #dce5ef; }
+html[data-theme="light"] .code-line { color: #223249; }
+html[data-theme="light"] .code-line.traced { background: #fff1d6; color: #5c3a00; }
+html[data-theme="light"] .code-number { color: #8a9bb0; }

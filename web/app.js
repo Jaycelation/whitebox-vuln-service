@@ -9,6 +9,7 @@ const evidenceLabels = {
   unverified: "Chưa chứng minh", false_positive: "False positive",
 };
 function evidenceLevel(finding) { return finding.evidence?.level || "present"; }
+const agentLabels = { confirmed: "xác nhận", false_positive: "false positive", uncertain: "chưa đủ dữ liệu" };
 const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false, unlocked: false };
 
 function node(tag, className, content) {
@@ -163,7 +164,12 @@ async function loadSelectedReport() {
     if (state.selected !== id) return;
     state.report = report;
     const failed = (report.scanners || []).filter((scanner) => scanner.status !== "completed");
-    setRunBanner(failed.length ? `Báo cáo chưa đầy đủ: ${failed.map((item) => item.name).join(", ")} không hoàn tất. Xem trạng thái scanner trong JSON.` : "");
+    const notes = [];
+    if (failed.length) notes.push(`Báo cáo chưa đầy đủ: ${failed.map((item) => item.name).join(", ")} không hoàn tất. Xem trạng thái scanner trong JSON.`);
+    const check = report.verification;
+    if (check?.status === "completed" && check.reviewed) notes.push(`Claude đã kiểm chứng ${check.reviewed} finding có điểm: ${check.confirmed} xác nhận, ${check.false_positive} false positive, ${check.uncertain} chưa đủ dữ liệu${check.errors ? `, ${check.errors} lỗi` : ""}.`);
+    if (check?.status === "failed") notes.push(`Không chạy được bước kiểm chứng bằng Claude: ${check.error || "lỗi không rõ"}.`);
+    setRunBanner(notes.join(" "));
   } catch (error) {
     if (error.status === 401) { lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại."); return; }
     setRunBanner(error.status === 409 ? "Báo cáo chưa sẵn sàng. Trang sẽ thử tải lại." : `Không tải được báo cáo: ${error.message}`);
@@ -283,6 +289,7 @@ function renderFindings() {
     const level = evidenceLevel(finding);
     const rule = node("span", "finding-rule", finding.rule_id || finding.category || "");
     rule.prepend(node("span", `evidence-chip ${level}`, evidenceLabels[level] || level));
+    if (finding.agent_review) rule.prepend(node("span", `agent-chip ${finding.agent_review.verdict}`, `Claude: ${agentLabels[finding.agent_review.verdict] || finding.agent_review.verdict}`));
     description.append(node("span", "finding-title", finding.title || "Potential issue"), rule);
     const locationCell = node("td");
     locationCell.append(node("span", "location", `${finding.path || "Unknown file"}${finding.line ? `:${finding.line}` : ""}`));
@@ -347,6 +354,43 @@ function showDetail(finding) {
     evidenceBox.append(node("p", "cvss-none", `Không chấm CVSS: chưa có bằng chứng cho thấy lỗi khai thác được trong code này.${advisory}`));
   }
   content.append(evidenceBox);
+  const review = finding.agent_review;
+  if (review) {
+    const box = node("section", "detail-section");
+    box.append(node("h3", "", `CLAUDE REVIEW · ${(agentLabels[review.verdict] || review.verdict).toUpperCase()}`));
+    box.append(node("p", `agent-summary ${review.verdict}`, review.summary || "—"));
+    if (review.attack_scenario) box.append(node("p", "agent-detail", `Kịch bản tấn công: ${review.attack_scenario}`));
+    if ((review.blocking_controls || []).length) {
+      const controls = node("ul", "evidence-list");
+      for (const control of review.blocking_controls) controls.append(node("li", "", control));
+      box.append(node("p", "agent-detail", "Cơ chế chặn:"), controls);
+    }
+    if (review.reasoning) {
+      const details = node("details", "agent-reasoning");
+      details.append(node("summary", "", "Lập luận chi tiết"), node("p", "", review.reasoning));
+      box.append(details);
+    }
+    box.append(node("p", "agent-meta", `${review.model || "Claude"} · ${review.reviewed_at || ""}${finding.triage_decided_by === "manual" ? " · quyết định của reviewer được giữ nguyên" : ""}`));
+    content.append(box);
+  }
+  const windows = Array.isArray(finding.code_context) ? finding.code_context : [];
+  if (windows.length) {
+    const box = node("section", "detail-section");
+    box.append(node("h3", "", "CODE"));
+    const traceLines = new Set((finding.trace || []).map((step) => `${step.path}:${step.line}`));
+    for (const window of windows) {
+      box.append(node("p", "code-file", window.path));
+      const pre = node("pre", "code-window");
+      window.lines.forEach((line, offset) => {
+        const number = window.start_line + offset;
+        const row = node("span", traceLines.has(`${window.path}:${number}`) ? "code-line traced" : "code-line");
+        row.append(node("span", "code-number", String(number)), document.createTextNode(line));
+        pre.append(row);
+      });
+      box.append(pre);
+    }
+    content.append(box);
+  }
   const check = finding.fp_check;
   if (check && check.verdict && check.verdict !== "needs_review") {
     const reasons = (check.reasons || []).join(" ");
