@@ -11,7 +11,7 @@ services:
         JOERN_VERSION: ${JOERN_VERSION:-4.0.631}
         INSTALL_JOERN: ${INSTALL_JOERN:-0}
     ports:
-      - "127.0.0.1:${PORT:-8000}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"
     environment:
       API_KEY: ${API_KEY:-}
       DATA_DIR: /data

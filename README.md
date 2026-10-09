@@ -31,7 +31,7 @@ docker compose up --build -d
 
 The API binds to `127.0.0.1:8000`. Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for interactive API documentation. The first build downloads scanner binaries; Semgrep rules and vulnerability databases may be fetched when scans run. Source archives are not sent to a scanning SaaS by this service, although the scanners may access their rule/advisory services for updates and matching. The sample Compose file uses Cloudflare and Google public DNS; set `DNS_SERVER` and `DNS_FALLBACK_SERVER` in `.env` to your organization resolvers when needed.
 
-For a private network deployment, set a long random `API_KEY` in `.env` and place the service behind a trusted TLS reverse proxy. Do not bind the unauthenticated default configuration to a public interface. If you change Compose port binding, configure authentication first.
+For a private network deployment, set a long random `API_KEY` in `.env`, set `BIND_ADDRESS=0.0.0.0`, and place the service behind a trusted TLS reverse proxy. Allow the selected TCP port through the host firewall only for trusted clients. Do not bind the unauthenticated default configuration to a public interface.
 
 ## Submit a scan
 
