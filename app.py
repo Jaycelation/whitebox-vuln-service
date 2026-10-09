@@ -11,6 +11,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +25,8 @@ from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPExcepti
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+import whitebox_dataflow
 
 
 def positive_int_setting(name: str, default: int) -> int:
@@ -47,13 +50,15 @@ SCAN_CONCURRENCY = positive_int_setting("SCAN_CONCURRENCY", 1)
 SCANNER_PARALLELISM = positive_int_setting("SCANNER_PARALLELISM", 1)
 MAX_SCANNER_PROCESSES = positive_int_setting("MAX_SCANNER_PROCESSES", SCAN_CONCURRENCY * SCANNER_PARALLELISM)
 API_KEY = os.getenv("API_KEY", "")
-DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
+DEFAULT_SCANNERS = ("semgrep", "dataflow", "gitleaks", "trivy", "osv-scanner")
 SCANNER_BINARIES = {
     "semgrep": "semgrep",
     "gitleaks": "gitleaks",
     "trivy": "trivy",
     "osv-scanner": "osv-scanner",
     "joern": "joern-scan",
+    # Cross-function source-to-sink analysis; runs Semgrep several times.
+    "dataflow": "semgrep",
 }
 # Every Trivy process that finds its vulnerability database out of date downloads
 # it into the shared cache, so concurrent runs repeat the download and write the
@@ -632,6 +637,45 @@ def parse_joern(path: Path, source_root: Path) -> list[dict[str, Any]]:
     return findings
 
 
+def parse_dataflow(data: Any, source_root: Path) -> list[dict[str, Any]]:
+    findings = []
+    for item in data.get("findings", []) if isinstance(data, dict) else []:
+        details = whitebox_dataflow.VULN_CLASSES.get(item.get("class")) if isinstance(item, dict) else None
+        if details is None:
+            continue
+        trace = []
+        for step in item.get("trace", [])[:20]:
+            if not isinstance(step, dict):
+                continue
+            line = step.get("line")
+            trace.append({
+                "kind": clean_text(step.get("kind"), 20),
+                "path": normalized_path(step.get("path"), source_root),
+                "line": line if isinstance(line, int) and line > 0 else None,
+                "detail": clean_text(step.get("detail"), 300),
+            })
+        steps = " → ".join(f"{step['detail']} ({step['path']}:{step['line']})" for step in trace)
+        finding = make_finding(
+            tool="dataflow",
+            category="sast",
+            severity=details["severity"],
+            title=f"{details['title']}: request input reaches {details['sink']}",
+            message=steps or f"Request input reaches {details['sink']}.",
+            path=item.get("path"),
+            line=item.get("line"),
+            end_line=item.get("end_line"),
+            rule_id=f"dataflow.{clean_text(item.get('language'), 20)}.{item['class']}",
+            # Flows through summarized helpers match functions by name, so they are less certain.
+            confidence="medium" if item.get("interprocedural") else "high",
+            references=[f"https://cwe.mitre.org/data/definitions/{details['cwe'].split('-')[1]}.html"],
+            source_root=source_root,
+        )
+        finding["cwe"] = details["cwe"]
+        finding["trace"] = trace
+        findings.append(finding)
+    return findings
+
+
 def scanner_command(name: str, source_root: Path, raw_output: Path) -> list[str]:
     binary = SCANNER_BINARIES[name]
     if name == "semgrep":
@@ -644,6 +688,11 @@ def scanner_command(name: str, source_root: Path, raw_output: Path) -> list[str]
         return [binary, "scan", "source", "-r", str(source_root), "--format", "json"]
     if name == "joern":
         return [binary, str(source_root), "--overwrite"]
+    if name == "dataflow":
+        # Leave the analysis time to finish its last pass and write a report.
+        deadline = max(SCAN_TIMEOUT_SECONDS - 30, 30)
+        script = Path(whitebox_dataflow.__file__).resolve()
+        return [sys.executable, str(script), "--output", str(raw_output), "--deadline", str(deadline), str(source_root)]
     raise ValueError("Unsupported scanner")
 
 
@@ -660,6 +709,7 @@ def parse_scanner_output(name: str, raw_output: Path, source_root: Path) -> list
         "gitleaks": parse_gitleaks,
         "trivy": parse_trivy,
         "osv-scanner": parse_osv,
+        "dataflow": parse_dataflow,
     }
     return parsers[name](data, source_root)
 
@@ -1509,6 +1559,14 @@ def findings_to_sarif(scan_id: str, report: dict[str, Any], findings: list[dict[
         }
         if location:
             result["locations"] = [location]
+        if finding.get("trace"):
+            result["codeFlows"] = [{"threadFlows": [{"locations": [
+                {"location": {
+                    "physicalLocation": {"artifactLocation": {"uri": step["path"]}, **({"region": {"startLine": step["line"]}} if step.get("line") else {})},
+                    "message": {"text": step.get("detail") or step.get("kind") or "step"},
+                }}
+                for step in finding["trace"] if step.get("path")
+            ]}]}]
         # Only human or agent decisions suppress a result; heuristic verdicts stay visible.
         if finding.get("triage_status") in ("false_positive", "accepted_risk"):
             suppression: dict[str, Any] = {"kind": "external", "status": "accepted"}

@@ -17,7 +17,7 @@ API_KEY = os.getenv("WHITEBOX_API_KEY", "")
 MAX_SOURCE_BYTES = int(os.getenv("WHITEBOX_MAX_SOURCE_BYTES", str(1024 * 1024 * 1024)))
 MAX_ARCHIVE_BYTES = int(os.getenv("WHITEBOX_MAX_ARCHIVE_BYTES", str(200 * 1024 * 1024)))
 MAX_SOURCE_FILES = int(os.getenv("WHITEBOX_MAX_SOURCE_FILES", "20000"))
-DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
+DEFAULT_SCANNERS = ("semgrep", "dataflow", "gitleaks", "trivy", "osv-scanner")
 KNOWN_SCANNERS = frozenset((*DEFAULT_SCANNERS, "joern"))
 EXCLUDED_DIRECTORIES = frozenset(
     {
@@ -193,8 +193,9 @@ async def whitebox_scan_repository(
     """Queue a scan of an authorized local repository and return its scan ID.
 
     Omit repository_path to scan the current Claude project directory (or the
-    MCP process working directory). Standard runs Semgrep, Gitleaks, Trivy, and
-    OSV-Scanner. standard_plus_joern also requires Joern to be installed in the
+    MCP process working directory). Standard runs Semgrep, the cross-function
+    dataflow analysis (request input to sink, with a trace per finding), Gitleaks,
+    Trivy, and OSV-Scanner. standard_plus_joern also requires Joern to be installed in the
     scanner service. Joern uses its installed query set; custom source/sink models
     are not implied by this profile.
     """
