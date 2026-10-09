@@ -336,11 +336,12 @@ def apply_triage(finding: dict[str, Any]) -> None:
     evidence = finding.get("evidence") or {}
     automatic = evidence.get("automatic") or {"level": evidence.get("level", "present"), "items": evidence.get("items", []), "cvss": finding.get("cvss")}
     status = finding.get("triage_status", "needs_review")
+    who = "Claude (agent review)" if finding.get("triage_decided_by") == "agent" else "A reviewer"
     if status == "false_positive":
-        level, items, cvss = "false_positive", ["A reviewer marked this finding as a false positive."], None
+        level, items, cvss = "false_positive", [f"{who} marked this finding as a false positive."], None
     elif status == "confirmed":
         level = "confirmed"
-        items = ["A reviewer confirmed this finding."] + ([f"Note: {finding['triage_note']}"] if finding.get("triage_note") else [])
+        items = [f"{who} confirmed this finding."] + ([f"Note: {finding['triage_note']}"] if finding.get("triage_note") else [])
         override = finding.get("triage_cvss_vector")
         if override and valid_vector(override):
             cvss = score(override, "reviewer", ["Vector set by the reviewer."])

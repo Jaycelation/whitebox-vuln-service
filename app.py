@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import whitebox_dataflow
 import whitebox_evidence
+import whitebox_verify
 
 
 def positive_int_setting(name: str, default: int) -> int:
@@ -46,6 +47,8 @@ MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "20000"))
 MAX_FINDINGS = int(os.getenv("MAX_FINDINGS", "10000"))
 SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "900"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
+VERIFY_MAX_FINDINGS = positive_int_setting("VERIFY_MAX_FINDINGS", 20)
+VERIFY_CONCURRENCY = positive_int_setting("VERIFY_CONCURRENCY", 3)
 PRUNE_INTERVAL_SECONDS = positive_int_setting("PRUNE_INTERVAL_SECONDS", 3600)
 SCAN_CONCURRENCY = positive_int_setting("SCAN_CONCURRENCY", 1)
 SCANNER_PARALLELISM = positive_int_setting("SCANNER_PARALLELISM", 1)
@@ -192,9 +195,10 @@ def initialize_storage() -> None:
             )"""
         )
         decision_columns = {column["name"] for column in db.execute("PRAGMA table_info(triage_decisions)")}
-        if "cvss_vector" not in decision_columns:
-            with suppress(sqlite3.OperationalError):
-                db.execute("ALTER TABLE triage_decisions ADD COLUMN cvss_vector TEXT")
+        for column, definition in (("cvss_vector", "TEXT"), ("decided_by", "TEXT NOT NULL DEFAULT 'manual'")):
+            if column not in decision_columns:
+                with suppress(sqlite3.OperationalError):
+                    db.execute(f"ALTER TABLE triage_decisions ADD COLUMN {column} {definition}")
 
 
 def job_dir(scan_id: str) -> Path:
@@ -1077,6 +1081,7 @@ def apply_triage_decisions(project: str, findings: list[dict[str, Any]]) -> None
             finding["triage_updated_at"] = decision["updated_at"]
             finding["triage_source"] = "earlier_scan"
             finding["triage_cvss_vector"] = decision["cvss_vector"]
+            finding["triage_decided_by"] = decision["decided_by"]
 
 
 async def process_scan(scan_id: str) -> None:
@@ -1112,6 +1117,8 @@ async def process_scan(scan_id: str) -> None:
         await complete_thread_work(check_false_positives, findings, source_root)
         apply_triage_decisions(row["name"], findings)
         await complete_thread_work(whitebox_evidence.assess, findings, source_root)
+        await complete_thread_work(whitebox_verify.attach_context, findings, source_root)
+        verification = await run_verification(row["name"], scan_id, findings)
         report = {
             "scan_id": scan_id,
             "created_at": row["created_at"],
@@ -1120,6 +1127,7 @@ async def process_scan(scan_id: str) -> None:
             "scanners": scanners,
             "findings": findings,
             "triage_note": "Scanner output is candidate evidence. Review each result in source context before treating it as a vulnerability.",
+            "verification": verification,
         }
         report["summary"]["findings_truncated"] = truncated
         report["summary"].update(triage_summary(findings))
@@ -1719,6 +1727,66 @@ class TriageUpdate(BaseModel):
 REPORT_WRITE_LOCK = threading.Lock()
 
 
+def store_triage_decision(db: sqlite3.Connection, project: str, key: str, status: str, note: str | None, updated_at: str,
+                          scan_id: str, finding_id: str, vector: str | None, decided_by: str) -> None:
+    db.execute(
+        "INSERT INTO triage_decisions (project, match_key, status, note, updated_at, scan_id, finding_id, cvss_vector, decided_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project, match_key) DO UPDATE SET "
+        "status = excluded.status, note = excluded.note, updated_at = excluded.updated_at, scan_id = excluded.scan_id, "
+        "finding_id = excluded.finding_id, cvss_vector = excluded.cvss_vector, decided_by = excluded.decided_by",
+        (project, key, status, note, updated_at, scan_id, finding_id, vector, decided_by),
+    )
+
+
+async def run_verification(project: str, scan_id: str, findings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Let Claude review the evidence-backed findings and record its verdicts."""
+    if not whitebox_verify.enabled():
+        return {"status": "disabled"}
+    try:
+        pairs = await whitebox_verify.verify_findings(
+            findings, model=whitebox_verify.VERIFY_MODEL, max_findings=VERIFY_MAX_FINDINGS, concurrency=VERIFY_CONCURRENCY,
+        )
+    except Exception as exc:  # for example the SDK or credentials are missing
+        LOGGER.exception("Claude verification failed")
+        return {"status": "failed", "error": clean_text(f"{type(exc).__name__}: {exc}", 300)}
+    decisions = [(finding, review) for finding, review in pairs if whitebox_verify.apply_review(finding, review)]
+    if decisions:
+        with connect_db() as db:
+            for finding, review in decisions:
+                store_triage_decision(db, project, finding.get("match_key") or finding_match_key(finding), finding["triage_status"],
+                                      finding["triage_note"], review["reviewed_at"], scan_id, finding["id"],
+                                      finding.get("triage_cvss_vector"), "agent")
+    return whitebox_verify.summary(pairs, whitebox_verify.VERIFY_MODEL)
+
+
+@api.post("/scans/{scan_id}/verify")
+async def verify_scan(scan_id: str) -> dict[str, Any]:
+    """Run (or re-run) Claude's review on a finished report, using the code stored with it."""
+    if not whitebox_verify.enabled():
+        raise HTTPException(status_code=409, detail="Claude verification is off; set VERIFY_WITH_CLAUDE=1 and ANTHROPIC_API_KEY.")
+    row, report = await asyncio.to_thread(load_report, scan_id)
+    result = await run_verification(row["name"], scan_id, report.get("findings") or [])
+
+    def save() -> dict[str, Any]:
+        with REPORT_WRITE_LOCK:
+            _, current = load_report(scan_id)
+            reviewed = {finding["id"]: finding for finding in report.get("findings") or [] if "agent_review" in finding}
+            for index, finding in enumerate(current.get("findings") or []):
+                if finding["id"] in reviewed and finding.get("triage_decided_by") != "manual":
+                    current["findings"][index] = reviewed[finding["id"]]
+            current["verification"] = result
+            current.setdefault("summary", {}).update(triage_summary(current["findings"]))
+            current["summary"].update(whitebox_evidence.summary(current["findings"]))
+            directory = job_dir(scan_id)
+            temporary = directory / "report.json.tmp"
+            temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), "utf-8")
+            temporary.replace(directory / "report.json")
+            update_scan(scan_id, summary_json=json.dumps(current["summary"]))
+            return result
+
+    return await asyncio.to_thread(save)
+
+
 @api.patch("/scans/{scan_id}/findings/{finding_id}")
 def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[str, Any]:
     status = update.status.strip().lower()
@@ -1750,18 +1818,13 @@ def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[
                 if status == "needs_review":
                     db.execute("DELETE FROM triage_decisions WHERE project = ? AND match_key = ?", (row["name"], key))
                 else:
-                    db.execute(
-                        "INSERT INTO triage_decisions (project, match_key, status, note, updated_at, scan_id, finding_id, cvss_vector) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project, match_key) DO UPDATE SET "
-                        "status = excluded.status, note = excluded.note, updated_at = excluded.updated_at, "
-                        "scan_id = excluded.scan_id, finding_id = excluded.finding_id, cvss_vector = excluded.cvss_vector",
-                        (row["name"], key, status, note, now, scan_id, finding["id"], vector),
-                    )
+                    store_triage_decision(db, row["name"], key, status, note, now, scan_id, finding["id"], vector, "manual")
                 finding["triage_status"] = status
                 finding["triage_note"] = note or None
                 finding["triage_updated_at"] = now
                 finding["triage_source"] = "manual"
                 finding["triage_cvss_vector"] = vector
+                finding["triage_decided_by"] = None if status == "needs_review" else "manual"
                 whitebox_evidence.apply_triage(finding)
         report.setdefault("summary", {}).update(triage_summary(findings))
         report["summary"].update(whitebox_evidence.summary(findings))

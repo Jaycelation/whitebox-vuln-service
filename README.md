@@ -195,6 +195,35 @@ Scores are computed with the CVSS 3.1 base formula, and `cvss.reasons` explains 
 
 A static trace is strong evidence but not a working exploit: validation in an `if` statement, configuration, and deployment can still make it unexploitable. Most advisories do not name the vulnerable function, so most dependency findings stop at `present`. On pygoat, 11 of 716 findings were scored. Each was a traced flow and a known vulnerability of the app, and views that check login scored 8.8 instead of 9.8. 222 dependency findings were `unverified` because the package is never imported.
 
+### Claude review of scored findings
+
+When enabled, Claude reviews each finding that has a CVSS score from a traced flow. It reads the trace and the code around every step, then records one of three verdicts:
+
+- `confirmed`: attacker-controlled input reaches the sink with nothing on the path that stops it. Claude describes the attack.
+- `false_positive`: a specific control blocks the flow, such as validation, conversion to a number, or a parameterized query. Claude names the control and its file and line.
+- `uncertain`: the code shown is not enough to decide. Nothing changes.
+
+`confirmed` and `false_positive` become triage decisions with `triage_decided_by: "agent"` and a note starting with `Claude (<model>):`, so the evidence level and CVSS follow, as for a person's decision. Claude may also return a corrected CVSS vector, for example when the endpoint requires an admin login. Each reviewed finding keeps `agent_review` with the verdict, summary, reasoning, attack scenario or blocking controls, model, and time. The report has a `verification` summary.
+
+Safeguards:
+
+- **A person's decision is never overridden.** Findings you triaged are skipped, and `POST /api/scans/{id}/verify` re-runs the review on a finished report without touching them.
+- **Verdicts must cite evidence.** The scanned code is untrusted and may contain comments written to steer a reviewer, so the prompt marks it as data. A `false_positive` that names no blocking control, or a `confirmed` without an attack, is downgraded to `uncertain`.
+- **Verdicts are reused.** They are stored per project and match key, so unchanged code is not sent again on the next scan.
+- **Refusals are handled.** Requests use the API's server-side fallback (`fallbacks: "default"`), so a request a safety classifier declines is retried on Anthropic's recommended model. A request that is still declined, or fails, leaves the finding `uncertain` and never fails the scan.
+
+**Data sent to Anthropic.** This step is off by default. When on, the code around each reviewed finding, about 12 lines on either side of each trace step and at most 400 lines per finding, is sent to the Claude API together with the trace. Lines that a secret scanner flagged are replaced with `[redacted: possible secret]`. The same excerpts are stored in the report as `code_context`, and the dashboard shows them with the traced lines highlighted. Enable it in `.env`:
+
+```sh
+VERIFY_WITH_CLAUDE=1
+ANTHROPIC_API_KEY=sk-ant-...
+VERIFY_MODEL=claude-opus-5-5     # default
+VERIFY_MAX_FINDINGS=20           # highest scores first, per scan
+VERIFY_CONCURRENCY=3
+```
+
+Then run `docker compose up -d`. The MCP adapter exposes the re-run as `whitebox_verify_scan`.
+
 ### False-positive checks
 
 While the source is still extracted, each finding gets `fp_check`: a `verdict`, the `reasons` for it, and `duplicate_of` when it repeats another finding. The check only advises. It never changes `triage_status` and never hides a finding.
@@ -247,4 +276,4 @@ python -m pip install -r requirements.txt -e .
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, the metrics endpoint, false-positive checks and triage, and source-to-sink analysis. The dataflow tests run Semgrep when it is installed (CI installs it) and are skipped otherwise. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, the metrics endpoint, false-positive checks and triage, source-to-sink analysis, evidence levels and CVSS, and Claude review (with the Anthropic SDK against a mocked HTTP transport, never the real API). The dataflow tests run Semgrep when it is installed (CI installs it) and are skipped otherwise. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
