@@ -3,18 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'">
-  <title>Astra · Whitebox Analysis</title>
+  <title>Whitebox · Scan Analysis</title>
   <link rel="stylesheet" href="/ui/styles.css">
   <script src="/ui/app.js" defer></script>
 </head>
 <body>
-  <div class="app-shell">
+  <main id="auth-screen" class="auth-screen">
+    <div class="auth-frame">
+      <div class="auth-top">
+        <div class="auth-brand"><span class="brand-mark">✳</span><span><strong>WHITEBOX</strong><small>SECURITY ANALYSIS</small></span></div>
+        <button class="theme-toggle secondary-button" type="button" aria-label="Đổi giao diện sáng tối">☀ Chế độ sáng</button>
+      </div>
+      <div class="auth-card">
+        <p class="eyebrow">ACCESS YOUR WORKSPACE</p>
+        <h1>Đăng nhập để xem báo cáo</h1>
+        <p class="auth-description">Nhập API key của dịch vụ để mở danh sách scan và các findings. Khóa chỉ được giữ trong bộ nhớ của tab này.</p>
+        <form id="key-form" autocomplete="off">
+          <label for="api-key">API key</label>
+          <input id="api-key" type="password" placeholder="Dán giá trị API_KEY trong file .env" autocomplete="off" spellcheck="false" required autofocus>
+          <button id="connect-button" class="primary-button" type="submit">Vào dashboard →</button>
+        </form>
+        <p id="login-error" class="login-error hidden" role="alert"></p>
+        <p class="auth-help">Bạn có thể tìm khóa ở dòng <code>API_KEY=</code> trong file <code>.env</code> của service.</p>
+      </div>
+      <a class="auth-docs" href="/docs" target="_blank" rel="noopener">API documentation ↗</a>
+    </div>
+  </main>
+
+  <div id="app-shell" class="app-shell hidden">
     <aside class="sidebar">
-      <a class="brand" href="/ui/" aria-label="Astra dashboard">
+      <a class="brand" href="/ui/" aria-label="Whitebox dashboard">
         <span class="brand-mark">✳</span>
-        <span><strong>ASTRA</strong><small>WHITEBOX ANALYSIS</small></span>
+        <span><strong>WHITEBOX</strong><small>SECURITY ANALYSIS</small></span>
       </a>
       <div class="side-heading"><span>WORKSPACE</span><span class="side-rule"></span></div>
       <div class="side-section-title"><span>Scan history</span><button id="refresh-scans" class="icon-button" type="button" aria-label="Làm mới danh sách" title="Làm mới">↻</button></div>
@@ -44,11 +66,8 @@
         <div class="breadcrumbs">Workspace <span>/</span> <strong>Analysis</strong></div>
         <div class="top-actions">
           <a href="/docs" target="_blank" rel="noopener">API docs ↗</a>
-          <form id="key-form" class="key-form" autocomplete="off">
-            <label for="api-key">API key</label>
-            <input id="api-key" type="password" placeholder="Nhập API key" autocomplete="off" spellcheck="false">
-            <button type="submit">Connect</button>
-          </form>
+          <button class="theme-toggle secondary-button" type="button" aria-label="Đổi giao diện sáng tối">☀ Chế độ sáng</button>
+          <button id="lock-session" class="secondary-button" type="button">Khóa màn hình</button>
         </div>
       </header>
 
@@ -56,9 +75,9 @@
         <div id="notice" class="notice hidden" role="status"></div>
         <section id="empty-state" class="empty-state">
           <div class="empty-icon">✳</div>
-          <p class="eyebrow">ASTRA / ANALYSIS</p>
+          <p class="eyebrow">WHITEBOX / ANALYSIS</p>
           <h1>Findings, in focus.</h1>
-          <p>Nhập API key để tải các lượt scan và xem báo cáo trực quan. Khóa chỉ được giữ trong bộ nhớ của tab này.</p>
+          <p>Chưa có lượt scan. Dùng New scan để tải mã nguồn ZIP lên.</p>
         </section>
 
         <div id="dashboard" class="hidden">

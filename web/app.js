@@ -3,7 +3,7 @@
 const $ = (id) => document.getElementById(id);
 const severityOrder = ["critical", "high", "medium", "low", "info", "unknown"];
 const severityRank = Object.fromEntries(severityOrder.map((name, index) => [name, index]));
-const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false };
+const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false, unlocked: false };
 
 function node(tag, className, content) {
   const element = document.createElement(tag);
@@ -44,9 +44,42 @@ function selectedFromHash() {
   return match ? match[1] : null;
 }
 function setConnectionStatus(value) { text("service-state", value); }
+function loginError(message) {
+  const element = $("login-error");
+  element.textContent = message;
+  element.classList.toggle("hidden", !message);
+}
+function unlockScreen() {
+  state.unlocked = true;
+  $("api-key").value = "";
+  $("auth-screen").classList.add("hidden");
+  $("app-shell").classList.remove("hidden");
+  loginError("");
+}
+function lockScreen(message = "") {
+  state.unlocked = false;
+  state.key = "";
+  state.scans = [];
+  state.selected = null;
+  state.report = null;
+  $("api-key").value = "";
+  $("app-shell").classList.add("hidden");
+  $("auth-screen").classList.remove("hidden");
+  loginError(message);
+  closeDetail();
+  $("api-key").focus();
+}
+function applyTheme(theme) {
+  const active = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = active;
+  document.querySelectorAll(".theme-toggle").forEach((button) => {
+    button.textContent = active === "light" ? "☾ Chế độ tối" : "☀ Chế độ sáng";
+  });
+  try { localStorage.setItem("whitebox-theme", active); } catch { /* Theme remains active for this page. */ }
+}
 
 async function loadScans({ quiet = false } = {}) {
-  if (state.loading) return;
+  if (state.loading) return false;
   state.loading = true;
   try {
     const data = await api("/api/scans?limit=200");
@@ -57,15 +90,17 @@ async function loadScans({ quiet = false } = {}) {
     state.selected = state.scans.some((scan) => scan.id === preferred) ? preferred : state.scans[0]?.id || null;
     renderScanList();
     await loadSelectedReport();
+    return Boolean(state.key);
   } catch (error) {
     setConnectionStatus(error.status === 401 ? "Key required" : "Unavailable");
-    if (!quiet && error.status !== 401) notice(`Không tải được danh sách scan: ${error.message}`, true);
-    if (!quiet && error.status === 401 && state.key) notice("API key không hợp lệ. Kiểm tra lại khóa trong .env.", true);
-    if (!state.scans.length) {
-      renderScanList();
-      $("dashboard").classList.add("hidden");
-      $("empty-state").classList.remove("hidden");
+    if (state.unlocked) {
+      if (error.status === 401) lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại.");
+      else if (!quiet) notice(`Không tải được danh sách scan: ${error.message}`, true);
+    } else {
+      state.key = "";
+      loginError(error.status === 401 ? "API key không đúng. Kiểm tra giá trị trong file .env." : `Không kết nối được dịch vụ: ${error.message}`);
     }
+    return false;
   } finally { state.loading = false; }
 }
 
@@ -124,6 +159,7 @@ async function loadSelectedReport() {
     const failed = (report.scanners || []).filter((scanner) => scanner.status !== "completed");
     setRunBanner(failed.length ? `Báo cáo chưa đầy đủ: ${failed.map((item) => item.name).join(", ")} không hoàn tất. Xem trạng thái scanner trong JSON.` : "");
   } catch (error) {
+    if (error.status === 401) { lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại."); return; }
     setRunBanner(error.status === 409 ? "Báo cáo chưa sẵn sàng. Trang sẽ thử tải lại." : `Không tải được báo cáo: ${error.message}`);
   }
   renderReport();
@@ -289,9 +325,19 @@ function closeDetail() {
 $("key-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   state.key = $("api-key").value.trim().replace(/^Bearer\s+/i, "");
+  if (!state.key) { loginError("Nhập API key để tiếp tục."); return; }
+  loginError("");
   state.scans = []; state.selected = null;
-  await loadScans();
+  const button = $("connect-button");
+  button.disabled = true;
+  button.textContent = "Đang kiểm tra...";
+  try { if (await loadScans()) unlockScreen(); }
+  finally { button.disabled = false; button.textContent = "Vào dashboard →"; }
 });
+$("lock-session").addEventListener("click", () => lockScreen());
+document.querySelectorAll(".theme-toggle").forEach((button) => button.addEventListener("click", () => {
+  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+}));
 $("refresh-scans").addEventListener("click", () => loadScans());
 $("finding-search").addEventListener("input", () => { state.shown = 40; renderFindings(); });
 $("severity-filter").addEventListener("change", () => { state.shown = 40; renderFindings(); });
@@ -306,7 +352,7 @@ $("download-report").addEventListener("click", () => {
   if (!state.report) return;
   const blob = new Blob([JSON.stringify(state.report, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
-  const link = node("a"); link.href = url; link.download = `astra-report-${state.selected}.json`;
+  const link = node("a"); link.href = url; link.download = `whitebox-report-${state.selected}.json`;
   document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
@@ -333,7 +379,10 @@ $("upload-form").addEventListener("submit", async (event) => {
     location.hash = `scan/${scan.id}`;
     notice("Đã nhận source. Scan đang xếp hàng.");
     await loadScans({ quiet: true });
-  } catch (error) { notice(`Không tạo được scan: ${error.message}`, true); }
+  } catch (error) {
+    if (error.status === 401) lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại.");
+    else notice(`Không tạo được scan: ${error.message}`, true);
+  }
   finally { button.disabled = false; button.textContent = "Upload & scan"; }
 });
 window.addEventListener("hashchange", () => {
@@ -342,5 +391,7 @@ window.addEventListener("hashchange", () => {
     state.selected = id; renderScanList(); loadSelectedReport();
   }
 });
-loadScans();
-setInterval(() => { if (state.scans.some((scan) => ["queued", "running"].includes(scan.status))) loadScans({ quiet: true }); }, 15000);
+let savedTheme = "dark";
+try { savedTheme = localStorage.getItem("whitebox-theme") || "dark"; } catch { /* Storage can be disabled. */ }
+applyTheme(savedTheme);
+setInterval(() => { if (state.unlocked && state.scans.some((scan) => ["queued", "running"].includes(scan.status))) loadScans({ quiet: true }); }, 15000);
