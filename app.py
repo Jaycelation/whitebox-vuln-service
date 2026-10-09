@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,13 +14,21 @@ import stat
 import time
 import uuid
 import zipfile
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+
+def positive_int_setting(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    value = int(raw) if raw else default
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
@@ -30,6 +39,10 @@ MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "20000"))
 MAX_FINDINGS = int(os.getenv("MAX_FINDINGS", "10000"))
 SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "900"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
+PRUNE_INTERVAL_SECONDS = positive_int_setting("PRUNE_INTERVAL_SECONDS", 3600)
+SCAN_CONCURRENCY = positive_int_setting("SCAN_CONCURRENCY", 1)
+SCANNER_PARALLELISM = positive_int_setting("SCANNER_PARALLELISM", 1)
+MAX_SCANNER_PROCESSES = positive_int_setting("MAX_SCANNER_PROCESSES", SCAN_CONCURRENCY * SCANNER_PARALLELISM)
 API_KEY = os.getenv("API_KEY", "")
 DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
 SCANNER_BINARIES = {
@@ -39,10 +52,62 @@ SCANNER_BINARIES = {
     "osv-scanner": "osv-scanner",
     "joern": "joern-scan",
 }
+# Every Trivy process that finds its vulnerability database out of date downloads
+# it into the shared cache, so concurrent runs repeat the download and write the
+# same files. Joern is a memory-heavy JVM. Semgrep runs that share HOME were
+# tested concurrently with the pinned version and are only bound by the total cap.
+DEFAULT_SCANNER_PROCESS_LIMITS = {"trivy": 1, "joern": 1}
+
+
+def scanner_process_limits(raw: str) -> dict[str, int]:
+    """Apply comma-separated name=limit overrides to the defaults; 0 removes a limit."""
+    limits = dict(DEFAULT_SCANNER_PROCESS_LIMITS)
+    for entry in raw.split(","):
+        if not entry.strip():
+            continue
+        name, separator, value = (part.strip() for part in entry.partition("="))
+        if not separator or name not in SCANNER_BINARIES or not value.isdigit():
+            raise ValueError(f"Invalid SCANNER_PROCESS_LIMITS entry: {entry.strip()!r}")
+        if int(value):
+            limits[name] = int(value)
+        else:
+            limits.pop(name, None)
+    return limits
+
+
+SCANNER_PROCESS_LIMITS = scanner_process_limits(os.getenv("SCANNER_PROCESS_LIMITS", ""))
+SCAN_STATUSES = ("queued", "running", "completed", "partial", "failed")
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secret", "dependency", "misconfiguration")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 RECOVERING = False
+SCANNER_SLOTS: ScannerSlots | None = None
+LOGGER = logging.getLogger("whitebox")
+
+
+class Metrics:
+    """Process-local counters for GET /api/metrics. They reset when the service restarts."""
+
+    def __init__(self) -> None:
+        self.active_scans = 0
+        self.active_scanner_processes = 0
+        self.scan_durations: dict[str, list[float]] = {}
+        self.scanner_runs: dict[tuple[str, str], int] = {}
+        self.scanner_durations: dict[str, list[float]] = {}
+
+    def observe_scan(self, status: str, seconds: float) -> None:
+        total = self.scan_durations.setdefault(status, [0.0, 0])
+        total[0] += seconds
+        total[1] += 1
+
+    def observe_scanner(self, name: str, status: str, seconds: float) -> None:
+        self.scanner_runs[(name, status)] = self.scanner_runs.get((name, status), 0) + 1
+        total = self.scanner_durations.setdefault(name, [0.0, 0])
+        total[0] += seconds
+        total[1] += 1
+
+
+METRICS = Metrics()
 
 
 async def complete_thread_work(function: Any, *args: Any) -> Any:
@@ -87,9 +152,22 @@ def initialize_storage() -> None:
                 finished_at TEXT,
                 scanners_json TEXT NOT NULL,
                 upload_bytes INTEGER NOT NULL,
-                error TEXT
+                error TEXT,
+                summary_json TEXT,
+                scanner_results_json TEXT
             )"""
         )
+        # Databases created before summaries were stored are upgraded in place.
+        existing = {column["name"] for column in db.execute("PRAGMA table_info(scans)")}
+        for column in ("summary_json", "scanner_results_json"):
+            if column not in existing:
+                try:
+                    db.execute(f"ALTER TABLE scans ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
+        db.execute("CREATE INDEX IF NOT EXISTS scans_status_created_at ON scans (status, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS scans_created_at ON scans (created_at)")
 
 
 def job_dir(scan_id: str) -> Path:
@@ -104,8 +182,12 @@ def get_scan_row(scan_id: str) -> sqlite3.Row | None:
 
 
 def update_scan(scan_id: str, **fields: Any) -> None:
-    allowed = {"status", "updated_at", "finished_at", "error"}
-    if not fields or not set(fields).issubset(allowed):
+    allowed = {"status", "updated_at", "finished_at", "error", "summary_json", "scanner_results_json"}
+    unknown = set(fields) - allowed
+    if unknown:
+        # Dropping the whole update would silently lose status changes too.
+        raise ValueError(f"Unsupported scan fields: {', '.join(sorted(unknown))}")
+    if not fields:
         return
     names = list(fields)
     assignments = ", ".join(f"{name} = ?" for name in names)
@@ -135,6 +217,11 @@ def public_scan(row: sqlite3.Row, *, include_summary: bool = True) -> dict[str, 
         "error": row["error"],
     }
     if include_summary:
+        if row["summary_json"] is not None:
+            result["summary"] = json.loads(row["summary_json"])
+            result["scanner_results"] = json.loads(row["scanner_results_json"] or "null")
+            return result
+        # Rows finished before summaries were stored: read the report once, then backfill.
         report_path = job_dir(row["id"]) / "report.json"
         if report_path.is_file():
             try:
@@ -143,7 +230,17 @@ def public_scan(row: sqlite3.Row, *, include_summary: bool = True) -> dict[str, 
                 result["scanner_results"] = report.get("scanners")
             except (OSError, json.JSONDecodeError):
                 result["summary"] = None
+            else:
+                store_report_summary(row["id"], result["summary"], result["scanner_results"])
     return result
+
+
+def store_report_summary(scan_id: str, summary: Any, scanner_results: Any) -> None:
+    with connect_db() as db:
+        db.execute(
+            "UPDATE scans SET summary_json = ?, scanner_results_json = ? WHERE id = ? AND summary_json IS NULL",
+            (json.dumps(summary), json.dumps(scanner_results), scan_id),
+        )
 
 
 def validate_zip_archive(path: Path) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
@@ -568,7 +665,9 @@ async def run_scanner(name: str, source_root: Path, work_dir: Path) -> tuple[dic
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             process = await asyncio.create_subprocess_exec(
                 *scanner_command(name, source_root, raw_output),
-                cwd=str(source_root),
+                # joern-scan writes its workspace into the working directory; keep it
+                # out of the source tree that other scanners may be reading.
+                cwd=str(work_dir if name == "joern" else source_root),
                 env=env,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -615,6 +714,59 @@ async def run_scanner(name: str, source_root: Path, work_dir: Path) -> tuple[dic
     )
 
 
+class ScannerSlots:
+    """Scanner process limits shared by every scan on one event loop."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.total = asyncio.Semaphore(MAX_SCANNER_PROCESSES)
+        self.per_scanner = {name: asyncio.Semaphore(limit) for name, limit in SCANNER_PROCESS_LIMITS.items()}
+
+    @asynccontextmanager
+    async def acquire(self, name: str):
+        async with AsyncExitStack() as stack:
+            if name in self.per_scanner:
+                # Wait for the tool's own slot first so a blocked scanner does
+                # not hold one of the shared process slots.
+                await stack.enter_async_context(self.per_scanner[name])
+            await stack.enter_async_context(self.total)
+            yield
+
+
+def scanner_slots() -> ScannerSlots:
+    global SCANNER_SLOTS
+    if SCANNER_SLOTS is None or SCANNER_SLOTS.loop is not asyncio.get_running_loop():
+        SCANNER_SLOTS = ScannerSlots()
+    return SCANNER_SLOTS
+
+
+async def run_scanner_in_slot(name: str, source_root: Path, work_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async with scanner_slots().acquire(name):
+        METRICS.active_scanner_processes += 1
+        try:
+            scanner_result, findings = await run_scanner(name, source_root, work_dir)
+        finally:
+            METRICS.active_scanner_processes -= 1
+    METRICS.observe_scanner(name, str(scanner_result.get("status", "unknown")), float(scanner_result.get("duration_seconds") or 0))
+    return scanner_result, findings
+
+
+async def run_scanners(names: list[str], source_root: Path, work_dir: Path) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Run a scan's scanners and return their results in the requested order."""
+    if SCANNER_PARALLELISM <= 1 or len(names) <= 1:
+        return [await run_scanner_in_slot(name, source_root, work_dir) for name in names]
+    parallel = asyncio.Semaphore(SCANNER_PARALLELISM)
+
+    async def run_one(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with parallel:
+            return await run_scanner_in_slot(name, source_root, work_dir)
+
+    # Cancelling the scan cancels every task here; run_scanner then stops its process group.
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(run_one(name), name=f"whitebox-scanner-{name}") for name in names]
+    return [task.result() for task in tasks]
+
+
 def summarize(findings: list[dict[str, Any]], scanners: list[dict[str, Any]]) -> dict[str, Any]:
     severities = {severity: 0 for severity in SEVERITIES}
     by_tool: dict[str, int] = {}
@@ -641,14 +793,17 @@ async def process_scan(scan_id: str) -> None:
     extract_dir = directory / "source"
     update_scan(scan_id, status="running", updated_at=utc_now(), error=None)
     interrupted = False
+    started = time.monotonic()
+    METRICS.active_scans += 1
     try:
         source_root = await complete_thread_work(extract_zip, upload_path, extract_dir)
         scanners: list[dict[str, Any]] = []
         findings: list[dict[str, Any]] = []
         seen: set[str] = set()
         work_dir.mkdir(parents=True, exist_ok=True)
-        for name in json.loads(row["scanners_json"]):
-            scanner_result, scanner_findings = await run_scanner(name, source_root, work_dir)
+        results = await run_scanners(json.loads(row["scanners_json"]), source_root, work_dir)
+        # Merge in requested order so parallel runs dedupe and truncate exactly like sequential ones.
+        for scanner_result, scanner_findings in results:
             scanners.append(scanner_result)
             for finding in scanner_findings:
                 if finding["id"] in seen:
@@ -678,7 +833,16 @@ async def process_scan(scan_id: str) -> None:
             status = "partial"
         else:
             status = "failed"
-        update_scan(scan_id, status=status, updated_at=utc_now(), finished_at=utc_now(), error=None)
+        update_scan(
+            scan_id,
+            status=status,
+            updated_at=utc_now(),
+            finished_at=utc_now(),
+            error=None,
+            summary_json=json.dumps(report["summary"]),
+            scanner_results_json=json.dumps(scanners),
+        )
+        METRICS.observe_scan(status, time.monotonic() - started)
     except asyncio.CancelledError:
         interrupted = True
         update_scan(scan_id, status="queued", updated_at=utc_now(), error="Service restarted while this scan was running.")
@@ -686,7 +850,9 @@ async def process_scan(scan_id: str) -> None:
     except Exception as exc:
         message = "Source archive could not be extracted." if isinstance(exc, (ValueError, zipfile.BadZipFile)) else "Scan could not be completed."
         update_scan(scan_id, status="failed", updated_at=utc_now(), finished_at=utc_now(), error=message)
+        METRICS.observe_scan("failed", time.monotonic() - started)
     finally:
+        METRICS.active_scans -= 1
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(extract_dir, ignore_errors=True)
         if not interrupted:
@@ -728,21 +894,37 @@ def recover_and_prune() -> list[str]:
     return pending
 
 
-def prune_expired() -> None:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+def prune_expired() -> int:
+    # utc_now() is the only writer of created_at and produces fixed-width UTC
+    # ISO-8601 text, so string order is time order and the index can be used.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
     with connect_db() as db:
-        rows = db.execute("SELECT * FROM scans ORDER BY created_at").fetchall()
-        for row in rows:
-            created = datetime.fromisoformat(row["created_at"])
-            if row["status"] in ("completed", "partial", "failed") and created < cutoff:
-                shutil.rmtree(job_dir(row["id"]), ignore_errors=True)
-                db.execute("DELETE FROM scans WHERE id = ?", (row["id"],))
+        rows = db.execute(
+            "SELECT id FROM scans WHERE status IN ('completed', 'partial', 'failed') AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+    # Remove files outside any write transaction so slow disks never block other writers.
+    for row in rows:
+        shutil.rmtree(job_dir(row["id"]), ignore_errors=True)
+        with connect_db() as db:
+            db.execute("DELETE FROM scans WHERE id = ?", (row["id"],))
+    return len(rows)
+
+
+async def prune_periodically() -> None:
+    while True:
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
+        try:
+            await complete_thread_work(prune_expired)
+        except Exception:
+            LOGGER.exception("Pruning expired scans failed; retrying in %s seconds", PRUNE_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global JOB_QUEUE, RECOVERING
+    global JOB_QUEUE, RECOVERING, SCANNER_SLOTS
     JOB_QUEUE = asyncio.Queue(maxsize=10)
+    SCANNER_SLOTS = None
     initialize_storage()
     pending = recover_and_prune()
     initial = pending[:JOB_QUEUE.maxsize]
@@ -756,18 +938,26 @@ async def lifespan(_: FastAPI):
             await JOB_QUEUE.put(scan_id)
         RECOVERING = False
 
-    worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
+    workers = [
+        asyncio.create_task(queue_worker(), name=f"whitebox-scan-worker-{index}")
+        for index in range(SCAN_CONCURRENCY)
+    ]
     recovery = asyncio.create_task(feed_recovered_jobs(), name="whitebox-queue-recovery")
+    pruner = asyncio.create_task(prune_periodically(), name="whitebox-pruner")
     try:
         # Even an oversized durable backlog must not block API startup.
         yield
     finally:
-        recovery.cancel()
-        with suppress(asyncio.CancelledError):
-            await recovery
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await worker
+        for task in (recovery, pruner):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        # Each interrupted scan goes back to queued with its upload kept for retry.
+        for worker in workers:
+            worker.cancel()
+        for worker in workers:
+            with suppress(asyncio.CancelledError):
+                await worker
         RECOVERING = False
 
 
@@ -852,13 +1042,82 @@ def get_scanners() -> dict[str, Any]:
     return {"scanners": scanner_inventory(), "default": list(DEFAULT_SCANNERS)}
 
 
+def count_scans_by_status() -> dict[str, int]:
+    counts = dict.fromkeys(SCAN_STATUSES, 0)
+    with connect_db() as db:
+        for row in db.execute("SELECT status, COUNT(*) AS total FROM scans GROUP BY status"):
+            counts[row["status"]] = row["total"]
+    return counts
+
+
+def prometheus_label(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_metrics(scans_by_status: dict[str, int]) -> str:
+    lines: list[str] = []
+
+    def family(name: str, kind: str, help_text: str, samples: list[tuple[str, dict[str, str], float]]) -> None:
+        lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} {kind}"))
+        for suffix, labels, value in samples:
+            label_text = ",".join(f'{key}="{prometheus_label(label)}"' for key, label in labels.items())
+            number = str(value) if isinstance(value, int) else repr(round(float(value), 6))
+            lines.append(f"{name}{suffix}{{{label_text}}} {number}" if labels else f"{name}{suffix} {number}")
+
+    family("whitebox_queue_depth", "gauge", "Scans waiting in the queue.", [("", {}, JOB_QUEUE.qsize())])
+    family("whitebox_queue_capacity", "gauge", "Scans the queue holds before uploads get 503.", [("", {}, JOB_QUEUE.maxsize)])
+    family("whitebox_recovering", "gauge", "1 while recovered scans are still being queued after a restart.", [("", {}, int(RECOVERING))])
+    family(
+        "whitebox_scans", "gauge", "Stored scans by status.",
+        [("", {"status": status}, total) for status, total in sorted(scans_by_status.items())],
+    )
+    family("whitebox_scan_workers", "gauge", "Scans this process can run at once (SCAN_CONCURRENCY).", [("", {}, SCAN_CONCURRENCY)])
+    family("whitebox_active_scans", "gauge", "Scans this process is running now.", [("", {}, METRICS.active_scans)])
+    family(
+        "whitebox_scanner_process_limit", "gauge", "Scanner processes allowed at once (MAX_SCANNER_PROCESSES).",
+        [("", {}, MAX_SCANNER_PROCESSES)],
+    )
+    family(
+        "whitebox_active_scanner_processes", "gauge", "Scanner processes this process is running now.",
+        [("", {}, METRICS.active_scanner_processes)],
+    )
+    scan_durations = {status: METRICS.scan_durations.get(status, [0.0, 0]) for status in ("completed", "partial", "failed")}
+    family(
+        "whitebox_scan_duration_seconds", "summary", "Time from scan start to finish since this process started.",
+        [
+            sample
+            for status, (seconds, count) in sorted(scan_durations.items())
+            for sample in (("_sum", {"status": status}, seconds), ("_count", {"status": status}, count))
+        ],
+    )
+    family(
+        "whitebox_scanner_runs_total", "counter", "Scanner runs by result since this process started.",
+        [("", {"scanner": name, "status": status}, total) for (name, status), total in sorted(METRICS.scanner_runs.items())],
+    )
+    family(
+        "whitebox_scanner_duration_seconds", "summary", "Scanner run time since this process started.",
+        [
+            sample
+            for name, (seconds, count) in sorted(METRICS.scanner_durations.items())
+            for sample in (("_sum", {"scanner": name}, seconds), ("_count", {"scanner": name}, count))
+        ],
+    )
+    return "\n".join(lines) + "\n"
+
+
+@api.get("/metrics", response_class=PlainTextResponse)
+async def get_metrics() -> PlainTextResponse:
+    scans_by_status = await asyncio.to_thread(count_scans_by_status)
+    # Render on the event loop so the counters are not read while scans update them.
+    return PlainTextResponse(render_metrics(scans_by_status), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 @api.post("/scans", status_code=202)
 async def create_scan(
     source: UploadFile = File(..., description="ZIP archive containing a source tree"),
     scanners: str = Form(",".join(DEFAULT_SCANNERS), description="Comma-separated scanner names"),
     name: str = Form("source-upload", max_length=100),
 ) -> dict[str, Any]:
-    prune_expired()
     requested = list(dict.fromkeys(part.strip() for part in scanners.split(",") if part.strip()))
     if not requested:
         raise HTTPException(status_code=422, detail="Select at least one scanner")

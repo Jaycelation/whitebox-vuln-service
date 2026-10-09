@@ -138,6 +138,7 @@ Other endpoints:
 
 - `GET /api/scanners` lists installed scanners.
 - `GET /api/scans?limit=50` lists recent jobs.
+- `GET /api/metrics` returns Prometheus text-format metrics: queue depth, stored scans by status, active scans and scanner processes, and scan and scanner run counts and durations. It uses the same bearer token as the other `/api` endpoints. Counts and durations cover the running process and reset when the service restarts.
 - `DELETE /api/scans/{id}` removes a finished job and its report.
 - `GET /health` is an unauthenticated health check.
 
@@ -145,11 +146,11 @@ Other endpoints:
 
 Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, and `triage_status: needs_review`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
 
-Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
+Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Expired jobs are removed at startup and then every hour in the background; set `PRUNE_INTERVAL_SECONDS` to change the interval. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
 
 `completed` means every requested scanner completed; `partial` means some completed and some failed or timed out. If none completed, the job is `failed`, and its report still contains scanner diagnostics and any parsed findings. A failure before scanner execution (such as an extraction error) has no report; check the scan's `error` field.
 
-Accepted jobs survive service restarts. An interrupted scan retains its source ZIP and starts again from a clean extraction on startup. Recovery handles one interrupted job plus all ten queued jobs. If concurrent uploads fill the queue, excess requests receive HTTP `503` and can be retried; their temporary uploads are removed.
+Accepted jobs survive service restarts. An interrupted scan retains its source ZIP and starts again from a clean extraction on startup. Recovery handles every interrupted job (one per `SCAN_CONCURRENCY` worker) plus all ten queued jobs. If concurrent uploads fill the queue, excess requests receive HTTP `503` and can be retried; their temporary uploads are removed.
 
 Larger recovery backlogs are fed into the queue in the background so the API can start immediately. New uploads receive HTTP `503` while recovered jobs are still waiting to enter the queue.
 
@@ -157,7 +158,9 @@ Larger recovery backlogs are fed into the queue in the background so the API can
 
 - Default upload size is 200 MiB; expanded ZIP size is limited to 1 GiB.
 - The API accepts up to 20,000 ZIP entries by default. The MCP adapter defaults to 20,000 source files and checks the size of the finalized ZIP, including its directory metadata. If you customize these limits, keep `WHITEBOX_MAX_SOURCE_FILES` at or below the API's `MAX_ARCHIVE_ENTRIES`.
-- One scan runs at a time, with up to 10 queued jobs.
+- By default one scan runs at a time and runs its scanners one after another, with up to 10 queued jobs. `SCAN_CONCURRENCY` sets how many scans run at once, and `SCANNER_PARALLELISM` sets how many scanners one scan runs at once. `MAX_SCANNER_PROCESSES` caps scanner processes across all scans and defaults to the product of the two. Reports do not depend on these settings: scanners and findings keep the requested order.
+- `SCANNER_PROCESS_LIMITS` caps individual tools across all scans. It takes comma-separated `name=limit` overrides of the default `trivy=1,joern=1`; `0` removes a cap. Each Trivy process that finds its vulnerability database out of date downloads it into the shared cache, so concurrent Trivy runs repeat the download and write the same files. Joern is a memory-heavy JVM. Semgrep 1.179.0 was tested running concurrently with a shared home directory and has no cap by default.
+- More concurrency needs more CPU and memory. The Compose file limits the container to 2 CPUs and 6 GB (`CPU_LIMIT`, `MEMORY_LIMIT`); raise them along with these settings. Semgrep already uses two jobs per process, and `pids_limit` (512) counts threads as well as processes. Measure with your own repositories before raising limits; `GET /api/metrics` shows queue depth, active scanner processes, and scanner run times.
 - Run one Uvicorn worker per data directory, as configured in the Docker image. The queue is local to that process; multiple API workers or replicas sharing a data directory are not supported.
 - Each scanner has a 15-minute timeout by default.
 - ZIP traversal paths, duplicate paths, encrypted entries, and symlinks are rejected.
@@ -175,4 +178,4 @@ python -m pip install -r requirements.txt -e .
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, and MCP archive limits. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, and the metrics endpoint. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
