@@ -1231,3 +1231,30 @@ html[data-theme="light"] .trace-step::before { background: #fff; border-color: #
 html[data-theme="light"] .trace-step.source::before { background: #0f8f81; }
 html[data-theme="light"] .trace-step.sink::before { background: #c42b3d; border-color: #c42b3d; }
 html[data-theme="light"] .trace-location { color: #5a6b80; }
+
+/* Evidence levels and CVSS scores. */
+.cvss-badge { display: inline-block; margin-top: 5px; border-radius: 4px; padding: 3px 6px; font-size: 10px; font-weight: 800; letter-spacing: .03em; white-space: nowrap; background: #2a3547; color: #d3dceb; }
+.severity-badge + .cvss-badge { display: block; width: max-content; }
+.cvss-badge.critical { background: #ff8d96; color: #2a0b10; }
+.cvss-badge.high { background: #ffb582; color: #2b1404; }
+.cvss-badge.medium { background: #efd080; color: #2a2005; }
+.cvss-badge.low { background: #97baf2; color: #0b1c33; }
+.evidence-chip { display: inline-block; margin-right: 7px; border-radius: 999px; padding: 1px 7px; font-size: 10px; font-weight: 700; background: #2a3547; color: #a3b0c1; }
+.evidence-chip.confirmed { background: #1b3d38; color: #62d8ad; }
+.evidence-chip.reachable { background: #4c2838; color: #ff8d96; }
+.evidence-chip.unverified, .evidence-chip.false_positive { background: transparent; color: #7f94aa; border: 1px solid #30445a; }
+.evidence-list { margin: 0 0 10px; padding-left: 18px; display: grid; gap: 5px; font-size: 13px; line-height: 1.5; }
+.cvss-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 8px; }
+.cvss-line .cvss-badge { margin-top: 0; font-size: 11px; }
+.cvss-vector { font-size: 11px; word-break: break-all; }
+.cvss-none { font-size: 13px; color: #9aadc0; line-height: 1.55; }
+html[data-theme="light"] .cvss-badge { background: #e8edf3; color: #45566c; }
+html[data-theme="light"] .cvss-badge.critical { background: #b42336; color: #fff; }
+html[data-theme="light"] .cvss-badge.high { background: #a5480b; color: #fff; }
+html[data-theme="light"] .cvss-badge.medium { background: #8a5d00; color: #fff; }
+html[data-theme="light"] .cvss-badge.low { background: #1f5ca8; color: #fff; }
+html[data-theme="light"] .evidence-chip { background: #e8edf3; color: #45566c; }
+html[data-theme="light"] .evidence-chip.confirmed { background: #dcf5ec; color: #11734f; }
+html[data-theme="light"] .evidence-chip.reachable { background: #fde4e7; color: #b42336; }
+html[data-theme="light"] .evidence-chip.unverified, html[data-theme="light"] .evidence-chip.false_positive { background: transparent; color: #5a6b80; border-color: #dce5ef; }
+html[data-theme="light"] .cvss-none { color: #5a6b80; }
