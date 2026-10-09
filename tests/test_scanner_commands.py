@@ -45,3 +45,15 @@ class OsvNoManifestTests(unittest.IsolatedAsyncioTestCase):
     async def test_other_exit_128_errors_still_fail(self):
         result, _ = await self.run_fake_osv('fatal: database download failed\n')
         self.assertEqual(result['status'], 'failed')
+
+
+class ImageTests(unittest.TestCase):
+    def test_dockerfile_copies_every_local_module_the_app_imports(self):
+        import ast
+        root = Path(__file__).resolve().parent.parent
+        tree = ast.parse((root / 'app.py').read_text())
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        local = {name for name in imported if (root / f'{name}.py').is_file()}
+        dockerfile = (root / 'Dockerfile').read_text()
+        self.assertTrue(local)
+        self.assertEqual(sorted(name for name in local if f'{name}.py' not in dockerfile), [])
