@@ -112,13 +112,30 @@ Every finding has a stable id, scanner, category, severity, rule/advisory id, fi
 
 Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
 
+`completed` means every requested scanner completed; `partial` means some completed and some failed or timed out. If none completed, the job is `failed`, and its report still contains scanner diagnostics and any parsed findings. A failure before scanner execution (such as an extraction error) has no report; check the scan's `error` field.
+
+Accepted jobs survive service restarts. An interrupted scan retains its source ZIP and starts again from a clean extraction on startup. Recovery handles one interrupted job plus all ten queued jobs. If concurrent uploads fill the queue, excess requests receive HTTP `503` and can be retried; their temporary uploads are removed.
+
 ## Limits and data flow
 
 - Default upload size is 200 MiB; expanded ZIP size is limited to 1 GiB.
+- The API accepts up to 20,000 ZIP entries by default. The MCP adapter defaults to 20,000 source files and checks the size of the finalized ZIP, including its directory metadata. If you customize these limits, keep `WHITEBOX_MAX_SOURCE_FILES` at or below the API's `MAX_ARCHIVE_ENTRIES`.
 - One scan runs at a time, with up to 10 queued jobs.
+- Run one Uvicorn worker per data directory, as configured in the Docker image. The queue is local to that process; multiple API workers or replicas sharing a data directory are not supported.
 - Each scanner has a 15-minute timeout by default.
 - ZIP traversal paths, duplicate paths, encrypted entries, and symlinks are rejected.
 - The scanner container runs as an unprivileged user with all Linux capabilities dropped and a read-only root filesystem.
 - Semgrep `auto`, Trivy vulnerability data, and OSV vulnerability matching can require internet access. Scanners do not receive credentials from this service.
 - Semgrep-maintained rules have usage restrictions. This configuration is for your own internal, self-hosted use; do not offer it as a competing or hosted SaaS scanner without checking the rule license and obtaining the required rights.
 - This is static analysis and dependency checking, not proof that a finding is exploitable. Reports need human validation.
+
+## Development checks
+
+Install the service and MCP dependencies in a virtual environment, then run the regression suite:
+
+```bash
+python -m pip install -r requirements.txt -e .
+python -m unittest discover -s tests -v
+```
+
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, and MCP archive limits. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
