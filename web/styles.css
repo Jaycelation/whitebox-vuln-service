@@ -1215,3 +1215,19 @@ html[data-theme="light"] .severity-badge.high { background: #fdeadb; color: #a54
 html[data-theme="light"] .severity-badge.medium { background: #fbf0d6; color: #8a5d00; }
 html[data-theme="light"] .severity-badge.low { background: #e1ecfb; color: #1f5ca8; }
 html[data-theme="light"] .severity-badge.info { background: #dcf5f1; color: #0f6f63; }
+
+/* Data-flow trace: one row per step, source and sink marked. */
+.trace-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
+.trace-step { position: relative; display: grid; gap: 3px; padding: 0 0 14px 22px; border-left: 2px solid #30445a; margin-left: 6px; }
+.trace-step:last-child { border-left-color: transparent; padding-bottom: 0; }
+.trace-step::before { content: ""; position: absolute; left: -7px; top: 2px; width: 12px; height: 12px; border-radius: 50%; background: #2a3547; border: 2px solid #55dfd0; }
+.trace-step.source::before { background: #55dfd0; }
+.trace-step.sink::before { background: #ff8d96; border-color: #ff8d96; }
+.trace-detail { font-size: 13px; line-height: 1.45; }
+.trace-location { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: #8899ad; word-break: break-all; }
+html[data-theme="light"] .trace-step { border-left-color: #dce5ef; }
+html[data-theme="light"] .trace-step:last-child { border-left-color: transparent; }
+html[data-theme="light"] .trace-step::before { background: #fff; border-color: #0f8f81; }
+html[data-theme="light"] .trace-step.source::before { background: #0f8f81; }
+html[data-theme="light"] .trace-step.sink::before { background: #c42b3d; border-color: #c42b3d; }
+html[data-theme="light"] .trace-location { color: #5a6b80; }

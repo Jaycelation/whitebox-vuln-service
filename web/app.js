@@ -298,7 +298,26 @@ function showDetail(finding) {
     dl.append(node("dt", "", label), node("dd", "", value || "—"));
   }
   info.append(dl); content.append(info);
-  detailSection(content, "EVIDENCE", finding.message || finding.title);
+  const trace = Array.isArray(finding.trace) ? finding.trace : [];
+  if (trace.length) {
+    const section = node("section", "detail-section");
+    section.append(node("h3", "", "DATA FLOW · SOURCE → SINK"));
+    const list = node("ol", "trace-list");
+    for (const step of trace) {
+      const item = node("li", `trace-step ${["source", "sink"].includes(step.kind) ? step.kind : "hop"}`);
+      item.append(node("span", "trace-detail", step.detail || step.kind || "Step"), node("span", "trace-location", `${step.path || "?"}${step.line ? `:${step.line}` : ""}`));
+      list.append(item);
+    }
+    section.append(list);
+    content.append(section);
+  } else {
+    detailSection(content, "EVIDENCE", finding.message || finding.title);
+  }
+  const check = finding.fp_check;
+  if (check && check.verdict && check.verdict !== "needs_review") {
+    const reasons = (check.reasons || []).join(" ");
+    detailSection(content, "FALSE-POSITIVE CHECK", `${check.verdict === "duplicate" ? "Duplicate" : "Likely false positive"}. ${reasons}`);
+  }
   const refs = Array.isArray(finding.references) ? finding.references : [];
   if (refs.length) {
     const section = node("section", "detail-section"); section.append(node("h3", "", "REFERENCES"));
