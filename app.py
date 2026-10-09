@@ -40,6 +40,7 @@ SCANNER_BINARIES = {
     "joern": "joern-scan",
 }
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
+CATEGORIES = ("sast", "secret", "dependency", "misconfiguration")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 RECOVERING = False
 
@@ -932,8 +933,7 @@ def get_scan(scan_id: str) -> dict[str, Any]:
     return public_scan(row)
 
 
-@api.get("/scans/{scan_id}/report")
-def get_report(scan_id: str) -> dict[str, Any]:
+def load_report(scan_id: str) -> tuple[sqlite3.Row, dict[str, Any]]:
     job_dir(scan_id)
     row = get_scan_row(scan_id)
     if row is None:
@@ -942,9 +942,160 @@ def get_report(scan_id: str) -> dict[str, Any]:
     if not report_path.is_file():
         raise HTTPException(status_code=409, detail=f"Report is not ready; scan status is {row['status']}")
     try:
-        return json.loads(report_path.read_text("utf-8"))
+        return row, json.loads(report_path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail="Stored report is unreadable") from exc
+
+
+def parse_filter_values(raw: str | None, allowed: tuple[str, ...], label: str) -> set[str] | None:
+    if raw is None:
+        return None
+    values = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not values:
+        return None
+    invalid = sorted(values - set(allowed))
+    if invalid:
+        raise HTTPException(status_code=422, detail={"message": f"Unknown {label}", "invalid": invalid, "allowed": list(allowed)})
+    return values
+
+
+def filter_findings(
+    findings: list[dict[str, Any]],
+    *,
+    severity: set[str] | None,
+    tool: set[str] | None,
+    category: set[str] | None,
+    path_contains: str | None,
+) -> list[dict[str, Any]]:
+    needle = path_contains.lower() if path_contains else None
+    selected = []
+    for finding in findings:
+        if severity is not None and finding.get("severity") not in severity:
+            continue
+        if tool is not None and finding.get("tool") not in tool:
+            continue
+        if category is not None and finding.get("category") not in category:
+            continue
+        if needle is not None and needle not in (finding.get("path") or "").lower():
+            continue
+        selected.append(finding)
+    return selected
+
+
+SARIF_LEVELS = {
+    "critical": "error",
+    "high": "error",
+    "medium": "warning",
+    "low": "note",
+    "info": "note",
+    "unknown": "none",
+}
+
+
+def findings_to_sarif(scan_id: str, report: dict[str, Any], findings: list[dict[str, Any]]) -> dict[str, Any]:
+    runs: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        tool = finding.get("tool") or "whitebox"
+        run = runs.setdefault(
+            tool,
+            {
+                "tool": {"driver": {"name": tool, "informationUri": "https://github.com/Jaycelation/whitebox-vuln-service", "rules": []}},
+                "results": [],
+                "_rule_index": {},
+            },
+        )
+        driver = run["tool"]["driver"]
+        rule_key = finding.get("rule_id") or finding.get("title") or "finding"
+        if rule_key not in run["_rule_index"]:
+            run["_rule_index"][rule_key] = len(driver["rules"])
+            driver["rules"].append(
+                {
+                    "id": rule_key,
+                    "name": rule_key,
+                    "shortDescription": {"text": clean_text(finding.get("title"), 240) or rule_key},
+                    "helpUri": (finding.get("references") or [None])[0],
+                    "properties": {"category": finding.get("category"), "security-severity-level": finding.get("severity")},
+                }
+            )
+        location: dict[str, Any] = {}
+        if finding.get("path"):
+            region: dict[str, Any] = {}
+            if finding.get("line"):
+                region["startLine"] = finding["line"]
+            if finding.get("end_line"):
+                region["endLine"] = finding["end_line"]
+            physical: dict[str, Any] = {"artifactLocation": {"uri": finding["path"]}}
+            if region:
+                physical["region"] = region
+            location = {"physicalLocation": physical}
+        result = {
+            "ruleId": rule_key,
+            "ruleIndex": run["_rule_index"][rule_key],
+            "level": SARIF_LEVELS.get(finding.get("severity"), "none"),
+            "message": {"text": finding.get("message") or finding.get("title") or rule_key},
+            "partialFingerprints": {"whiteboxFindingId": finding.get("id", "")},
+            "properties": {
+                "severity": finding.get("severity"),
+                "confidence": finding.get("confidence"),
+                "triage_status": finding.get("triage_status"),
+            },
+        }
+        if location:
+            result["locations"] = [location]
+        run["results"].append(result)
+    for run in runs.values():
+        run.pop("_rule_index", None)
+    return {
+        "version": "2.1.0",
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "runs": list(runs.values()) or [{"tool": {"driver": {"name": "whitebox-vuln-service", "rules": []}}, "results": []}],
+    }
+
+
+@api.get("/scans/{scan_id}/report")
+def get_report(
+    scan_id: str,
+    severity: str | None = None,
+    tool: str | None = None,
+    category: str | None = None,
+    path_contains: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    _, report = load_report(scan_id)
+    findings = report.get("findings") or []
+    severity_filter = parse_filter_values(severity, SEVERITIES, "severity")
+    tool_filter = parse_filter_values(tool, tuple(SCANNER_BINARIES), "tool")
+    category_filter = parse_filter_values(category, CATEGORIES, "category")
+    if any(value is not None for value in (severity_filter, tool_filter, category_filter, path_contains)):
+        findings = filter_findings(
+            findings,
+            severity=severity_filter,
+            tool=tool_filter,
+            category=category_filter,
+            path_contains=clean_text(path_contains, 1000) if path_contains else None,
+        )
+    matched = len(findings)
+    offset = max(0, offset)
+    if offset or limit is not None:
+        end = offset + max(0, limit) if limit is not None else None
+        findings = findings[offset:end]
+    report["findings"] = findings
+    report["filter"] = {
+        "matched": matched,
+        "returned": len(findings),
+        "offset": offset,
+        "limit": limit,
+        "applied": {"severity": severity, "tool": tool, "category": category, "path_contains": path_contains},
+    }
+    return report
+
+
+@api.get("/scans/{scan_id}/report.sarif")
+def get_report_sarif(scan_id: str) -> JSONResponse:
+    _, report = load_report(scan_id)
+    sarif = findings_to_sarif(scan_id, report, report.get("findings") or [])
+    return JSONResponse(content=sarif, media_type="application/sarif+json")
 
 
 @api.delete("/scans/{scan_id}", status_code=204)

@@ -53,6 +53,41 @@ curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID
 curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report
 ```
 
+### Filter the report
+
+`GET /api/scans/SCAN_ID/report` accepts optional query parameters to narrow large reports server-side. Filtering and pagination are applied to the `findings` array only; the `summary` always reflects the full scan. The response gains a `filter` object describing what was matched and returned.
+
+| Parameter | Description |
+| --- | --- |
+| `severity` | Comma-separated: `critical`, `high`, `medium`, `low`, `info`, `unknown` |
+| `tool` | Comma-separated: `semgrep`, `gitleaks`, `trivy`, `osv-scanner`, `joern` |
+| `category` | Comma-separated: `sast`, `secret`, `dependency`, `misconfiguration` |
+| `path_contains` | Case-insensitive substring match on a finding's `path` |
+| `limit`, `offset` | Paginate the matched findings |
+
+An unknown `severity`, `tool`, or `category` value returns `422` with the offending values listed.
+
+```sh
+# Only high and critical SAST findings, first 20
+curl -sS 'http://127.0.0.1:8000/api/scans/SCAN_ID/report?severity=critical,high&category=sast&limit=20'
+```
+
+### SARIF export
+
+`GET /api/scans/SCAN_ID/report.sarif` returns the findings as SARIF 2.1.0 (`application/sarif+json`), with one run per tool. This uploads directly to GitHub code scanning or any SARIF-aware viewer. Severities map to SARIF levels as critical/high → `error`, medium → `warning`, low/info → `note`, unknown → `none`.
+
+```sh
+curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report.sarif -o results.sarif
+```
+
+## Tests
+
+The report-endpoint tests run with the service's virtualenv and do not require pytest:
+
+```sh
+DATA_DIR=$(mktemp -d) .venv/bin/python tests/test_report_endpoints.py
+```
+
 ## MCP integration for Claude Code and ChatGPT
 
 The MCP adapter lets an agent queue scans against a local source directory and retrieve scanner status and findings. Source files are archived locally and uploaded directly to this service; the MCP responses contain findings and summaries, not source contents. The adapter accepts scan paths only under `WHITEBOX_ALLOWED_ROOTS`. If that variable is unset, it limits access to Claude Code's `CLAUDE_PROJECT_DIR` or the MCP process's working directory.
