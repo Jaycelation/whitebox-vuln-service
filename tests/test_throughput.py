@@ -1,7 +1,9 @@
 import asyncio
 import io
 import json
+import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 import uuid
@@ -195,6 +197,237 @@ class StorageTests(ServiceTestCase):
         with self.assertRaisesRegex(ValueError, 'not_a_column'):
             service.update_scan(scan_id, status='completed', not_a_column='x')
         self.assertEqual(service.get_scan_row(scan_id)['status'], 'queued')
+
+
+class FakeScanners:
+    """Stand-in for run_scanner that records how many scanners overlap."""
+
+    def __init__(self, delays=None, findings=None, gate=None):
+        self.delays = delays or {}
+        self.findings = findings or {}
+        self.gate = gate
+        self.running = []
+        self.started = []
+        self.max_total = 0
+        self.max_by_name = {}
+
+    async def run(self, name, source_root, work_dir):
+        self.running.append(name)
+        self.started.append(name)
+        self.max_total = max(self.max_total, len(self.running))
+        self.max_by_name[name] = max(self.max_by_name.get(name, 0), self.running.count(name))
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            else:
+                await asyncio.sleep(self.delays.get(name, 0.02))
+        finally:
+            self.running.remove(name)
+        result = {'name': name, 'status': 'completed', 'duration_seconds': self.delays.get(name, 0.02)}
+        return result, list(self.findings.get(name, []))
+
+
+class ConcurrencyTests(ServiceTestCase):
+    def settings(self, *, scans=1, parallel=1, total=None, limits=None):
+        return patch.multiple(
+            service,
+            SCAN_CONCURRENCY=scans,
+            SCANNER_PARALLELISM=parallel,
+            MAX_SCANNER_PROCESSES=total or scans * parallel,
+            SCANNER_PROCESS_LIMITS=dict(service.DEFAULT_SCANNER_PROCESS_LIMITS) if limits is None else limits,
+            SCANNER_SLOTS=None,
+        )
+
+    async def wait_until(self, condition, timeout=5):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not condition():
+            if loop.time() > deadline:
+                self.fail('condition was not reached in time')
+            await asyncio.sleep(0.005)
+
+    @staticmethod
+    def read_pid(path):
+        try:
+            text = path.read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
+
+    async def test_default_settings_run_scanners_one_at_a_time_in_order(self):
+        names = ['osv-scanner', 'semgrep', 'gitleaks', 'trivy']
+        scan_id = self.seed(scanners=names)
+        fake = FakeScanners()
+        with self.settings(), patch.object(service, 'run_scanner', new=fake.run):
+            await service.process_scan(scan_id)
+        self.assertEqual(fake.started, names)
+        self.assertEqual(fake.max_total, 1)
+        self.assertEqual(service.get_scan_row(scan_id)['status'], 'completed')
+
+    async def test_scan_concurrency_runs_queued_scans_at_the_same_time(self):
+        ids = [self.seed(scanners=['gitleaks']) for _ in range(2)]
+        both_running = asyncio.Event()
+        active = set()
+
+        async def scanner(name, source_root, work_dir):
+            active.add(work_dir)
+            if len(active) == 2:
+                both_running.set()
+            await asyncio.wait_for(both_running.wait(), timeout=5)
+            return {'name': name, 'status': 'completed'}, []
+
+        with self.settings(scans=2), patch.object(service, 'run_scanner', side_effect=scanner):
+            async with service.lifespan(service.app):
+                await asyncio.wait_for(both_running.wait(), timeout=5)
+                await asyncio.wait_for(service.JOB_QUEUE.join(), timeout=5)
+        self.assertEqual([service.get_scan_row(scan_id)['status'] for scan_id in ids], ['completed', 'completed'])
+
+    async def test_parallel_report_matches_sequential_report(self):
+        names = ['semgrep', 'gitleaks', 'trivy', 'osv-scanner']
+        # Later scanners finish first, and every scanner reports the same 'shared' finding.
+        delays = {'semgrep': 0.08, 'gitleaks': 0.06, 'trivy': 0.04, 'osv-scanner': 0.02}
+        findings = {
+            name: [
+                {'id': f'{name}-1', 'tool': name, 'severity': 'high', 'title': 'one'},
+                {'id': 'shared', 'tool': name, 'severity': 'low', 'title': 'shared'},
+                {'id': f'{name}-2', 'tool': name, 'severity': 'medium', 'title': 'two'},
+            ]
+            for name in names
+        }
+        reports = {}
+        for parallel in (1, 4):
+            scan_id = self.seed(scanners=names)
+            fake = FakeScanners(delays, findings)
+            with self.settings(parallel=parallel), patch.object(service, 'MAX_FINDINGS', 5), \
+                 patch.object(service, 'run_scanner', new=fake.run):
+                await service.process_scan(scan_id)
+            self.assertEqual(fake.max_total, parallel)
+            report = service.get_report(scan_id)
+            reports[parallel] = {key: report[key] for key in ('summary', 'scanners', 'findings')}
+        self.assertEqual(reports[4], reports[1])
+        self.assertEqual([finding['id'] for finding in reports[4]['findings']],
+                         ['semgrep-1', 'shared', 'semgrep-2', 'gitleaks-1', 'gitleaks-2'])
+        self.assertEqual(reports[4]['findings'][1]['tool'], 'semgrep')
+        self.assertTrue(reports[4]['summary']['findings_truncated'])
+        self.assertEqual([scanner['name'] for scanner in reports[4]['scanners']], names)
+
+    async def test_trivy_never_runs_twice_across_concurrent_scans(self):
+        ids = [self.seed(scanners=['trivy', 'gitleaks']) for _ in range(2)]
+        gate = asyncio.Event()
+        fake = FakeScanners(gate=gate)
+        with self.settings(scans=2, parallel=2), patch.object(service, 'run_scanner', new=fake.run):
+            scans = asyncio.gather(*(service.process_scan(scan_id) for scan_id in ids))
+            try:
+                await self.wait_until(lambda: len(fake.running) == 3)
+                await asyncio.sleep(0.05)  # room for a wrongly unlimited second Trivy to start
+                self.assertEqual(sorted(fake.running), ['gitleaks', 'gitleaks', 'trivy'])
+            finally:
+                gate.set()
+                await scans
+        self.assertEqual(fake.max_by_name['trivy'], 1)
+        self.assertEqual(fake.started.count('trivy'), 2)
+
+    async def test_total_process_cap_holds_across_scans(self):
+        names = ['semgrep', 'gitleaks', 'trivy', 'osv-scanner']
+        ids = [self.seed(scanners=names) for _ in range(2)]
+        gate = asyncio.Event()
+        fake = FakeScanners(gate=gate)
+        with self.settings(scans=2, parallel=4, total=3, limits={}), \
+             patch.object(service, 'run_scanner', new=fake.run):
+            scans = asyncio.gather(*(service.process_scan(scan_id) for scan_id in ids))
+            try:
+                await self.wait_until(lambda: len(fake.running) == 3)
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(fake.running), 3)
+            finally:
+                gate.set()
+                await scans
+        self.assertEqual(fake.max_total, 3)
+        self.assertEqual(len(fake.started), 8)
+
+    async def test_cancelling_a_parallel_scan_stops_every_scanner_process(self):
+        names = ['semgrep', 'gitleaks', 'trivy', 'osv-scanner']
+        scan_id = self.seed(scanners=names)
+        work_dir = service.job_dir(scan_id) / 'work'
+        script = 'import os, sys, time; open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(60)'
+
+        def command(name, source_root, raw_output):
+            return [sys.executable, '-c', script, str(work_dir / f'{name}.pid')]
+
+        with self.settings(parallel=4, limits={}), patch.object(service, 'scanner_command', side_effect=command):
+            task = asyncio.create_task(service.process_scan(scan_id))
+            await self.wait_until(lambda: all(self.read_pid(work_dir / f'{name}.pid') for name in names), timeout=20)
+            pids = [self.read_pid(work_dir / f'{name}.pid') for name in names]
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        for pid in pids:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        self.assertEqual([task for task in asyncio.all_tasks() if task.get_name().startswith('whitebox-scanner-')], [])
+        self.assertEqual(service.get_scan_row(scan_id)['status'], 'queued')
+        self.assertTrue((service.job_dir(scan_id) / 'source.zip').is_file())
+
+    async def test_restart_requeues_every_interrupted_scan(self):
+        ids = [self.seed(scanners=['gitleaks']) for _ in range(12)]
+        running = set()
+        both_running = asyncio.Event()
+
+        async def blocked(name, source_root, work_dir):
+            running.add(work_dir)
+            if len(running) == 2:
+                both_running.set()
+            await asyncio.Event().wait()
+
+        with self.settings(scans=2), patch.object(service, 'run_scanner', side_effect=blocked):
+            async with service.lifespan(service.app):
+                await asyncio.wait_for(both_running.wait(), timeout=5)
+        rows = [service.get_scan_row(scan_id) for scan_id in ids]
+        self.assertEqual({row['status'] for row in rows}, {'queued'})
+        self.assertEqual(sum(row['error'] is not None for row in rows), 2)
+        self.assertTrue(all((service.job_dir(scan_id) / 'source.zip').is_file() for scan_id in ids))
+
+        finished = AsyncMock(return_value=({'name': 'gitleaks', 'status': 'completed'}, []))
+        with self.settings(scans=2), patch.object(service, 'run_scanner', new=finished):
+            async with service.lifespan(service.app):
+                await self.wait_until(
+                    lambda: all(service.get_scan_row(scan_id)['status'] == 'completed' for scan_id in ids),
+                    timeout=10,
+                )
+        self.assertEqual(finished.await_count, 12)
+
+    async def test_joern_works_outside_the_source_tree(self):
+        source_root = self.root / 'source'
+        work_dir = self.root / 'work'
+        source_root.mkdir()
+        work_dir.mkdir()
+        directories = {}
+
+        async def spawn(*command, cwd, **kwargs):
+            directories[command[0]] = cwd
+            raise FileNotFoundError(command[0])
+
+        with patch.object(service.asyncio, 'create_subprocess_exec', side_effect=spawn):
+            for name in ('joern', 'semgrep'):
+                result, _ = await service.run_scanner(name, source_root, work_dir)
+                self.assertEqual(result['status'], 'failed')
+        self.assertEqual(directories, {'joern-scan': str(work_dir), 'semgrep': str(source_root)})
+
+
+class SettingsTests(unittest.TestCase):
+    def test_scanner_process_limits_override_defaults(self):
+        self.assertEqual(service.scanner_process_limits(''), {'trivy': 1, 'joern': 1})
+        self.assertEqual(service.scanner_process_limits('trivy=2, semgrep=1'), {'trivy': 2, 'joern': 1, 'semgrep': 1})
+        self.assertEqual(service.scanner_process_limits('joern=0'), {'trivy': 1})
+        for invalid in ('trivy', 'unknown=1', 'trivy=-1', 'trivy=x'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                service.scanner_process_limits(invalid)
+
+    def test_positive_int_settings_reject_zero_and_default_when_empty(self):
+        with patch.dict(os.environ, {'SCAN_CONCURRENCY': '0'}), self.assertRaises(ValueError):
+            service.positive_int_setting('SCAN_CONCURRENCY', 1)
+        with patch.dict(os.environ, {'SCAN_CONCURRENCY': ''}):
+            self.assertEqual(service.positive_int_setting('SCAN_CONCURRENCY', 1), 1)
 
 
 if __name__ == '__main__':

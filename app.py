@@ -14,7 +14,7 @@ import stat
 import time
 import uuid
 import zipfile
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -40,6 +40,9 @@ MAX_FINDINGS = int(os.getenv("MAX_FINDINGS", "10000"))
 SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "900"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 PRUNE_INTERVAL_SECONDS = positive_int_setting("PRUNE_INTERVAL_SECONDS", 3600)
+SCAN_CONCURRENCY = positive_int_setting("SCAN_CONCURRENCY", 1)
+SCANNER_PARALLELISM = positive_int_setting("SCANNER_PARALLELISM", 1)
+MAX_SCANNER_PROCESSES = positive_int_setting("MAX_SCANNER_PROCESSES", SCAN_CONCURRENCY * SCANNER_PARALLELISM)
 API_KEY = os.getenv("API_KEY", "")
 DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
 SCANNER_BINARIES = {
@@ -49,10 +52,35 @@ SCANNER_BINARIES = {
     "osv-scanner": "osv-scanner",
     "joern": "joern-scan",
 }
+# Every Trivy process that finds its vulnerability database out of date downloads
+# it into the shared cache, so concurrent runs repeat the download and write the
+# same files. Joern is a memory-heavy JVM. Semgrep runs that share HOME were
+# tested concurrently with the pinned version and are only bound by the total cap.
+DEFAULT_SCANNER_PROCESS_LIMITS = {"trivy": 1, "joern": 1}
+
+
+def scanner_process_limits(raw: str) -> dict[str, int]:
+    """Apply comma-separated name=limit overrides to the defaults; 0 removes a limit."""
+    limits = dict(DEFAULT_SCANNER_PROCESS_LIMITS)
+    for entry in raw.split(","):
+        if not entry.strip():
+            continue
+        name, separator, value = (part.strip() for part in entry.partition("="))
+        if not separator or name not in SCANNER_BINARIES or not value.isdigit():
+            raise ValueError(f"Invalid SCANNER_PROCESS_LIMITS entry: {entry.strip()!r}")
+        if int(value):
+            limits[name] = int(value)
+        else:
+            limits.pop(name, None)
+    return limits
+
+
+SCANNER_PROCESS_LIMITS = scanner_process_limits(os.getenv("SCANNER_PROCESS_LIMITS", ""))
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secret", "dependency", "misconfiguration")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 RECOVERING = False
+SCANNER_SLOTS: ScannerSlots | None = None
 LOGGER = logging.getLogger("whitebox")
 
 
@@ -611,7 +639,9 @@ async def run_scanner(name: str, source_root: Path, work_dir: Path) -> tuple[dic
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             process = await asyncio.create_subprocess_exec(
                 *scanner_command(name, source_root, raw_output),
-                cwd=str(source_root),
+                # joern-scan writes its workspace into the working directory; keep it
+                # out of the source tree that other scanners may be reading.
+                cwd=str(work_dir if name == "joern" else source_root),
                 env=env,
                 stdout=stdout_file,
                 stderr=stderr_file,
@@ -658,6 +688,53 @@ async def run_scanner(name: str, source_root: Path, work_dir: Path) -> tuple[dic
     )
 
 
+class ScannerSlots:
+    """Scanner process limits shared by every scan on one event loop."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.total = asyncio.Semaphore(MAX_SCANNER_PROCESSES)
+        self.per_scanner = {name: asyncio.Semaphore(limit) for name, limit in SCANNER_PROCESS_LIMITS.items()}
+
+    @asynccontextmanager
+    async def acquire(self, name: str):
+        async with AsyncExitStack() as stack:
+            if name in self.per_scanner:
+                # Wait for the tool's own slot first so a blocked scanner does
+                # not hold one of the shared process slots.
+                await stack.enter_async_context(self.per_scanner[name])
+            await stack.enter_async_context(self.total)
+            yield
+
+
+def scanner_slots() -> ScannerSlots:
+    global SCANNER_SLOTS
+    if SCANNER_SLOTS is None or SCANNER_SLOTS.loop is not asyncio.get_running_loop():
+        SCANNER_SLOTS = ScannerSlots()
+    return SCANNER_SLOTS
+
+
+async def run_scanner_in_slot(name: str, source_root: Path, work_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async with scanner_slots().acquire(name):
+        return await run_scanner(name, source_root, work_dir)
+
+
+async def run_scanners(names: list[str], source_root: Path, work_dir: Path) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Run a scan's scanners and return their results in the requested order."""
+    if SCANNER_PARALLELISM <= 1 or len(names) <= 1:
+        return [await run_scanner_in_slot(name, source_root, work_dir) for name in names]
+    parallel = asyncio.Semaphore(SCANNER_PARALLELISM)
+
+    async def run_one(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with parallel:
+            return await run_scanner_in_slot(name, source_root, work_dir)
+
+    # Cancelling the scan cancels every task here; run_scanner then stops its process group.
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(run_one(name), name=f"whitebox-scanner-{name}") for name in names]
+    return [task.result() for task in tasks]
+
+
 def summarize(findings: list[dict[str, Any]], scanners: list[dict[str, Any]]) -> dict[str, Any]:
     severities = {severity: 0 for severity in SEVERITIES}
     by_tool: dict[str, int] = {}
@@ -690,8 +767,9 @@ async def process_scan(scan_id: str) -> None:
         findings: list[dict[str, Any]] = []
         seen: set[str] = set()
         work_dir.mkdir(parents=True, exist_ok=True)
-        for name in json.loads(row["scanners_json"]):
-            scanner_result, scanner_findings = await run_scanner(name, source_root, work_dir)
+        results = await run_scanners(json.loads(row["scanners_json"]), source_root, work_dir)
+        # Merge in requested order so parallel runs dedupe and truncate exactly like sequential ones.
+        for scanner_result, scanner_findings in results:
             scanners.append(scanner_result)
             for finding in scanner_findings:
                 if finding["id"] in seen:
@@ -807,8 +885,9 @@ async def prune_periodically() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global JOB_QUEUE, RECOVERING
+    global JOB_QUEUE, RECOVERING, SCANNER_SLOTS
     JOB_QUEUE = asyncio.Queue(maxsize=10)
+    SCANNER_SLOTS = None
     initialize_storage()
     pending = recover_and_prune()
     initial = pending[:JOB_QUEUE.maxsize]
@@ -822,7 +901,10 @@ async def lifespan(_: FastAPI):
             await JOB_QUEUE.put(scan_id)
         RECOVERING = False
 
-    worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
+    workers = [
+        asyncio.create_task(queue_worker(), name=f"whitebox-scan-worker-{index}")
+        for index in range(SCAN_CONCURRENCY)
+    ]
     recovery = asyncio.create_task(feed_recovered_jobs(), name="whitebox-queue-recovery")
     pruner = asyncio.create_task(prune_periodically(), name="whitebox-pruner")
     try:
@@ -833,9 +915,12 @@ async def lifespan(_: FastAPI):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await worker
+        # Each interrupted scan goes back to queued with its upload kept for retry.
+        for worker in workers:
+            worker.cancel()
+        for worker in workers:
+            with suppress(asyncio.CancelledError):
+                await worker
         RECOVERING = False
 
 
