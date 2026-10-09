@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>Whitebox · Scan Analysis</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <main id="auth-screen" class="auth-screen">
+    <div class="auth-frame">
+      <div class="auth-top">
+        <div class="auth-brand"><span class="brand-mark">✳</span><span><strong>WHITEBOX</strong><small>SECURITY ANALYSIS</small></span></div>
+        <button class="theme-toggle secondary-button" type="button" aria-label="Đổi giao diện sáng tối">☀ Chế độ sáng</button>
+      </div>
+      <div class="auth-card">
+        <p class="eyebrow">ACCESS YOUR WORKSPACE</p>
+        <h1>Đăng nhập để xem báo cáo</h1>
+        <p class="auth-description">Nhập API key của dịch vụ để mở danh sách scan và các findings. Khóa chỉ được giữ trong bộ nhớ của tab này.</p>
+        <form id="key-form" autocomplete="off">
+          <label for="api-key">API key</label>
+          <input id="api-key" type="password" placeholder="Dán giá trị API_KEY trong file .env" autocomplete="off" spellcheck="false" required autofocus>
+          <button id="connect-button" class="primary-button" type="submit">Vào dashboard →</button>
+        </form>
+        <p id="login-error" class="login-error hidden" role="alert"></p>
+        <p class="auth-help">Bạn có thể tìm khóa ở dòng <code>API_KEY=</code> trong file <code>.env</code> của service.</p>
+      </div>
+      <a class="auth-docs" href="/docs" target="_blank" rel="noopener">API documentation ↗</a>
+    </div>
+  </main>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <a class="brand" href="/ui/" aria-label="Whitebox dashboard">
+        <span class="brand-mark">✳</span>
+        <span><strong>WHITEBOX</strong><small>SECURITY ANALYSIS</small></span>
+      </a>
+      <div class="side-heading"><span>WORKSPACE</span><span class="side-rule"></span></div>
+      <div class="side-section-title"><span>Scan history</span><button id="refresh-scans" class="icon-button" type="button" aria-label="Làm mới danh sách" title="Làm mới">↻</button></div>
+      <div id="scan-list" class="scan-list" aria-live="polite"><p class="muted inset">Đang tải...</p></div>
+      <details class="upload-box">
+        <summary><span class="plus">＋</span> New scan</summary>
+        <form id="upload-form">
+          <label for="scan-name">Tên dự án</label>
+          <input id="scan-name" name="name" type="text" maxlength="100" placeholder="Ví dụ: NodeGoat" required>
+          <label for="scan-file">Mã nguồn ZIP</label>
+          <input id="scan-file" name="source" type="file" accept=".zip,application/zip" required>
+          <span class="field-label">Scanners</span>
+          <div class="check-grid">
+            <label><input type="checkbox" name="scanner" value="semgrep" checked> Semgrep</label>
+            <label><input type="checkbox" name="scanner" value="gitleaks" checked> Gitleaks</label>
+            <label><input type="checkbox" name="scanner" value="trivy" checked> Trivy</label>
+            <label><input type="checkbox" name="scanner" value="osv-scanner" checked> OSV</label>
+          </div>
+          <button class="primary-button full" type="submit">Upload &amp; scan</button>
+        </form>
+      </details>
+      <div class="sidebar-foot"><span class="status-dot"></span> Local service <span id="service-state">Đang kết nối</span></div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div class="breadcrumbs">Workspace <span>/</span> <strong>Analysis</strong></div>
+        <div class="top-actions">
+          <a href="/docs" target="_blank" rel="noopener">API docs ↗</a>
+          <button class="theme-toggle secondary-button" type="button" aria-label="Đổi giao diện sáng tối">☀ Chế độ sáng</button>
+          <button id="lock-session" class="secondary-button" type="button">Khóa màn hình</button>
+        </div>
+      </header>
+
+      <main class="content">
+        <div id="notice" class="notice hidden" role="status"></div>
+        <section id="empty-state" class="empty-state">
+          <div class="empty-icon">✳</div>
+          <p class="eyebrow">WHITEBOX / ANALYSIS</p>
+          <h1>Findings, in focus.</h1>
+          <p>Chưa có lượt scan. Dùng New scan để tải mã nguồn ZIP lên.</p>
+        </section>
+
+        <div id="dashboard" class="hidden">
+          <section class="page-intro">
+            <div>
+              <p class="eyebrow">SECURITY OVERVIEW <span class="eyebrow-line"></span> <span id="scan-date"></span></p>
+              <h1 id="project-title">Analysis</h1>
+              <p class="subtitle"><span id="scan-status" class="status-pill">—</span> <span id="scan-id"></span></p>
+            </div>
+            <div class="report-actions"><button id="download-report" class="secondary-button" type="button">↓ Export JSON</button></div>
+          </section>
+
+          <section id="run-banner" class="run-banner hidden" aria-live="polite"></section>
+
+          <section class="metric-grid" aria-label="Finding summary">
+            <button class="metric-card" data-severity="all" type="button"><span class="metric-label">TOTAL FINDINGS</span><strong id="metric-total">—</strong><span class="metric-foot">Across all scanners <span>↗</span></span></button>
+            <button class="metric-card critical" data-severity="critical" type="button"><span class="metric-label">CRITICAL</span><strong id="metric-critical">—</strong><span class="metric-foot">Requires review <span>↗</span></span></button>
+            <button class="metric-card high" data-severity="high" type="button"><span class="metric-label">HIGH</span><strong id="metric-high">—</strong><span class="metric-foot">Elevated risk <span>↗</span></span></button>
+            <button class="metric-card medium" data-severity="medium" type="button"><span class="metric-label">MEDIUM</span><strong id="metric-medium">—</strong><span class="metric-foot">Investigate <span>↗</span></span></button>
+          </section>
+
+          <section class="chart-grid">
+            <article class="panel severity-panel">
+              <div class="panel-head"><div><p class="eyebrow">DISTRIBUTION</p><h2>By severity</h2></div><span class="panel-meta" id="severity-count">— findings</span></div>
+              <div id="severity-chart" class="severity-chart"></div>
+              <div id="severity-legend" class="severity-legend"></div>
+            </article>
+            <article class="panel tool-panel">
+              <div class="panel-head"><div><p class="eyebrow">COVERAGE</p><h2>By scanner</h2></div><span class="panel-meta" id="scanner-count">— scanners</span></div>
+              <div id="tool-chart" class="tool-chart"></div>
+            </article>
+          </section>
+
+          <section class="findings-section">
+            <div class="section-head"><div><p class="eyebrow">DETAILED RESULTS</p><h2>Findings <span id="visible-count" class="count-badge">0</span></h2></div><p>Scanner results require manual validation.</p></div>
+            <div class="filter-bar">
+              <label class="search-wrap"><span>⌕</span><input id="finding-search" type="search" placeholder="Tìm title, file, rule ID..." aria-label="Tìm findings"></label>
+              <label class="select-wrap">Severity <select id="severity-filter"><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option><option value="unknown">Unknown</option></select></label>
+              <label class="select-wrap">Scanner <select id="tool-filter"><option value="all">All scanners</option></select></label>
+            </div>
+            <div class="table-wrap"><table><thead><tr><th>SEVERITY</th><th>FINDING</th><th>LOCATION</th><th>SCANNER</th><th></th></tr></thead><tbody id="findings-body"></tbody></table></div>
+            <div id="no-findings" class="no-findings hidden">Không có finding khớp bộ lọc.</div>
+            <button id="show-more" class="show-more hidden" type="button">Show more findings ↓</button>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div id="detail-backdrop" class="detail-backdrop hidden"></div>
+  <aside id="detail-panel" class="detail-panel hidden" aria-label="Finding details" aria-modal="true" role="dialog" tabindex="-1">
+    <div class="detail-top"><span class="eyebrow">FINDING DETAIL</span><button id="close-detail" class="icon-button" type="button" aria-label="Đóng">×</button></div>
+    <div id="detail-content"></div>
+  </aside>
+</body>
+</html>

@@ -51,6 +51,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt "semgrep==${SEMGREP_VERSION}"
 COPY app.py /app/app.py
+COPY web /app/web
 
 RUN groupadd --system scanner \
     && useradd --system --gid scanner --home-dir /data/home --create-home scanner \

@@ -21,7 +21,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
@@ -1228,7 +1229,12 @@ def health() -> dict[str, str]:
 
 @app.get("/")
 def home() -> dict[str, str]:
-    return {"service": "Whitebox Vulnerability Check Service", "docs": "/docs", "health": "/health"}
+    return {"service": "Whitebox Vulnerability Check Service", "ui": "/ui/", "docs": "/docs", "health": "/health"}
+
+
+@app.get("/ui", include_in_schema=False)
+def ui_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/ui/", status_code=307)
 
 
 @api.get("/scanners")
@@ -1649,3 +1655,4 @@ def delete_scan(scan_id: str) -> None:
 
 
 app.include_router(api)
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "web", html=True), name="ui")
