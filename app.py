@@ -41,6 +41,25 @@ SCANNER_BINARIES = {
 }
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
+RECOVERING = False
+
+
+async def complete_thread_work(function: Any, *args: Any) -> Any:
+    """Let filesystem work finish before cancellation triggers directory cleanup."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        with suppress(Exception, asyncio.CancelledError):
+            task.result()
+        raise
 
 
 def utc_now() -> str:
@@ -620,8 +639,9 @@ async def process_scan(scan_id: str) -> None:
     work_dir = directory / "work"
     extract_dir = directory / "source"
     update_scan(scan_id, status="running", updated_at=utc_now(), error=None)
+    interrupted = False
     try:
-        source_root = await asyncio.to_thread(extract_zip, upload_path, extract_dir)
+        source_root = await complete_thread_work(extract_zip, upload_path, extract_dir)
         scanners: list[dict[str, Any]] = []
         findings: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -650,9 +670,16 @@ async def process_scan(scan_id: str) -> None:
         temporary_report = directory / "report.json.tmp"
         temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
         temporary_report.replace(report_path)
-        status = "partial" if any(scanner["status"] != "completed" for scanner in scanners) else "completed"
+        completed = sum(scanner["status"] == "completed" for scanner in scanners)
+        if completed == len(scanners):
+            status = "completed"
+        elif completed:
+            status = "partial"
+        else:
+            status = "failed"
         update_scan(scan_id, status=status, updated_at=utc_now(), finished_at=utc_now(), error=None)
     except asyncio.CancelledError:
+        interrupted = True
         update_scan(scan_id, status="queued", updated_at=utc_now(), error="Service restarted while this scan was running.")
         raise
     except Exception as exc:
@@ -661,8 +688,9 @@ async def process_scan(scan_id: str) -> None:
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(extract_dir, ignore_errors=True)
-        with suppress(OSError):
-            upload_path.unlink()
+        if not interrupted:
+            with suppress(OSError):
+                upload_path.unlink()
 
 
 async def queue_worker() -> None:
@@ -674,7 +702,7 @@ async def queue_worker() -> None:
             JOB_QUEUE.task_done()
 
 
-def recover_and_prune() -> None:
+def recover_and_prune() -> list[str]:
     prune_expired()
     with connect_db() as db:
         rows = db.execute("SELECT * FROM scans WHERE status IN ('queued', 'running') ORDER BY created_at").fetchall()
@@ -686,11 +714,17 @@ def recover_and_prune() -> None:
                 )
     with connect_db() as db:
         rows = db.execute("SELECT id FROM scans WHERE status = 'queued' ORDER BY created_at").fetchall()
+    pending = []
     for row in rows:
-        if (job_dir(row["id"]) / "source.zip").is_file() and not JOB_QUEUE.full():
-            JOB_QUEUE.put_nowait(row["id"])
+        directory = job_dir(row["id"])
+        if (directory / "source.zip").is_file():
+            # A hard restart can leave an incomplete extraction or scanner output.
+            shutil.rmtree(directory / "source", ignore_errors=True)
+            shutil.rmtree(directory / "work", ignore_errors=True)
+            pending.append(row["id"])
         else:
             update_scan(row["id"], status="failed", updated_at=utc_now(), finished_at=utc_now(), error="Queued upload is no longer available.")
+    return pending
 
 
 def prune_expired() -> None:
@@ -706,15 +740,34 @@ def prune_expired() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global JOB_QUEUE, RECOVERING
+    JOB_QUEUE = asyncio.Queue(maxsize=10)
     initialize_storage()
-    recover_and_prune()
+    pending = recover_and_prune()
+    initial = pending[:JOB_QUEUE.maxsize]
+    for scan_id in initial:
+        JOB_QUEUE.put_nowait(scan_id)
+    RECOVERING = len(pending) > len(initial)
+
+    async def feed_recovered_jobs() -> None:
+        global RECOVERING
+        for scan_id in pending[len(initial):]:
+            await JOB_QUEUE.put(scan_id)
+        RECOVERING = False
+
     worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
+    recovery = asyncio.create_task(feed_recovered_jobs(), name="whitebox-queue-recovery")
     try:
+        # Even an oversized durable backlog must not block API startup.
         yield
     finally:
+        recovery.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
+        RECOVERING = False
 
 
 app = FastAPI(
@@ -815,7 +868,7 @@ async def create_scan(
     missing = [scanner for scanner in requested if scanner not in available]
     if missing:
         raise HTTPException(status_code=422, detail={"message": "Requested scanner is not installed", "missing": missing})
-    if JOB_QUEUE.full():
+    if RECOVERING or JOB_QUEUE.full():
         raise HTTPException(status_code=503, detail="Scan queue is full; retry later")
 
     scan_id = uuid.uuid4().hex
@@ -823,6 +876,7 @@ async def create_scan(
     directory.mkdir(parents=True, exist_ok=False)
     upload_path = directory / "source.zip"
     uploaded = 0
+    accepted = False
     try:
         with upload_path.open("xb") as output:
             while chunk := await source.read(1024 * 1024):
@@ -830,26 +884,35 @@ async def create_scan(
                 if uploaded > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail=f"ZIP exceeds the {MAX_UPLOAD_BYTES}-byte upload limit")
                 output.write(chunk)
-        await source.close()
         try:
-            await asyncio.to_thread(validate_zip_archive, upload_path)
+            await complete_thread_work(validate_zip_archive, upload_path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         display_name = clean_text(name, 100) or "source-upload"
         now = utc_now()
+        # Upload and validation yield control. Recheck immediately before the
+        # synchronous insert/enqueue pair so concurrent uploads cannot overfill.
+        if RECOVERING or JOB_QUEUE.full():
+            raise HTTPException(status_code=503, detail="Scan queue is full; retry later")
         with connect_db() as db:
             db.execute(
                 "INSERT INTO scans (id, name, status, created_at, updated_at, scanners_json, upload_bytes) VALUES (?, ?, 'queued', ?, ?, ?, ?)",
                 (scan_id, display_name, now, now, json.dumps(requested), uploaded),
             )
         JOB_QUEUE.put_nowait(scan_id)
+        accepted = True
         return {"id": scan_id, "status": "queued", "status_url": f"/api/scans/{scan_id}", "report_url": f"/api/scans/{scan_id}/report"}
     except HTTPException:
-        shutil.rmtree(directory, ignore_errors=True)
         raise
     except Exception as exc:
-        shutil.rmtree(directory, ignore_errors=True)
         raise HTTPException(status_code=400, detail="Could not accept the source archive") from exc
+    finally:
+        if not accepted:
+            shutil.rmtree(directory, ignore_errors=True)
+            with suppress(sqlite3.Error):
+                with connect_db() as db:
+                    db.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+        await source.close()
 
 
 @api.get("/scans")

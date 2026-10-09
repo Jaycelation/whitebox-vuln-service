@@ -16,7 +16,7 @@ API_URL = os.getenv("WHITEBOX_API_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.getenv("WHITEBOX_API_KEY", "")
 MAX_SOURCE_BYTES = int(os.getenv("WHITEBOX_MAX_SOURCE_BYTES", str(1024 * 1024 * 1024)))
 MAX_ARCHIVE_BYTES = int(os.getenv("WHITEBOX_MAX_ARCHIVE_BYTES", str(200 * 1024 * 1024)))
-MAX_SOURCE_FILES = int(os.getenv("WHITEBOX_MAX_SOURCE_FILES", "100000"))
+MAX_SOURCE_FILES = int(os.getenv("WHITEBOX_MAX_SOURCE_FILES", "20000"))
 DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
 KNOWN_SCANNERS = frozenset((*DEFAULT_SCANNERS, "joern"))
 EXCLUDED_DIRECTORIES = frozenset(
@@ -141,6 +141,9 @@ def _create_archive(repository: Path) -> tuple[Path, int, int]:
                     if archive_path.stat().st_size > MAX_ARCHIVE_BYTES:
                         raise ValueError("Archive exceeds WHITEBOX_MAX_ARCHIVE_BYTES")
 
+        # ZIP writes its central directory on close; it counts toward upload size.
+        if archive_path.stat().st_size > MAX_ARCHIVE_BYTES:
+            raise ValueError("Archive exceeds WHITEBOX_MAX_ARCHIVE_BYTES")
         if file_count == 0:
             raise ValueError("Repository has no scanable files")
         return archive_path, total_source_bytes, file_count
@@ -245,7 +248,7 @@ async def whitebox_scan_repository(
         "source_file_count": file_count,
         "source_bytes": source_bytes,
         "excluded_directories": sorted(EXCLUDED_DIRECTORIES),
-        "next_step": "Call whitebox_scan_status with this scan_id, then whitebox_get_report when status is completed or partial.",
+        "next_step": "Call whitebox_scan_status with this scan_id. When status is completed, partial, or failed, call whitebox_get_report. Failed scans may have a diagnostic report; archive extraction failures do not.",
     }
 
 
