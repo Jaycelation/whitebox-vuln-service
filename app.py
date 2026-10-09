@@ -41,6 +41,7 @@ SCANNER_BINARIES = {
 }
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
+RECOVERING = False
 
 
 async def complete_thread_work(function: Any, *args: Any) -> Any:
@@ -49,8 +50,15 @@ async def complete_thread_work(function: Any, *args: Any) -> Any:
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        with suppress(Exception):
-            await task
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        with suppress(Exception, asyncio.CancelledError):
+            task.result()
         raise
 
 
@@ -732,21 +740,34 @@ def prune_expired() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global JOB_QUEUE
+    global JOB_QUEUE, RECOVERING
     JOB_QUEUE = asyncio.Queue(maxsize=10)
     initialize_storage()
     pending = recover_and_prune()
-    worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
-    try:
-        # The worker drains the queue while recovery feeds it. A running job plus
-        # ten queued jobs must all survive a restart, even though capacity is ten.
-        for scan_id in pending:
+    initial = pending[:JOB_QUEUE.maxsize]
+    for scan_id in initial:
+        JOB_QUEUE.put_nowait(scan_id)
+    RECOVERING = len(pending) > len(initial)
+
+    async def feed_recovered_jobs() -> None:
+        global RECOVERING
+        for scan_id in pending[len(initial):]:
             await JOB_QUEUE.put(scan_id)
+        RECOVERING = False
+
+    worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
+    recovery = asyncio.create_task(feed_recovered_jobs(), name="whitebox-queue-recovery")
+    try:
+        # Even an oversized durable backlog must not block API startup.
         yield
     finally:
+        recovery.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
+        RECOVERING = False
 
 
 app = FastAPI(
@@ -847,7 +868,7 @@ async def create_scan(
     missing = [scanner for scanner in requested if scanner not in available]
     if missing:
         raise HTTPException(status_code=422, detail={"message": "Requested scanner is not installed", "missing": missing})
-    if JOB_QUEUE.full():
+    if RECOVERING or JOB_QUEUE.full():
         raise HTTPException(status_code=503, detail="Scan queue is full; retry later")
 
     scan_id = uuid.uuid4().hex
@@ -871,7 +892,7 @@ async def create_scan(
         now = utc_now()
         # Upload and validation yield control. Recheck immediately before the
         # synchronous insert/enqueue pair so concurrent uploads cannot overfill.
-        if JOB_QUEUE.full():
+        if RECOVERING or JOB_QUEUE.full():
             raise HTTPException(status_code=503, detail="Scan queue is full; retry later")
         with connect_db() as db:
             db.execute(
@@ -888,8 +909,9 @@ async def create_scan(
     finally:
         if not accepted:
             shutil.rmtree(directory, ignore_errors=True)
-            with connect_db() as db:
-                db.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+            with suppress(sqlite3.Error):
+                with connect_db() as db:
+                    db.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
         await source.close()
 
 

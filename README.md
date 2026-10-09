@@ -116,6 +116,8 @@ Source archives are removed after a scan. Normalized reports and metadata remain
 
 Accepted jobs survive service restarts. An interrupted scan retains its source ZIP and starts again from a clean extraction on startup. Recovery handles one interrupted job plus all ten queued jobs. If concurrent uploads fill the queue, excess requests receive HTTP `503` and can be retried; their temporary uploads are removed.
 
+Larger recovery backlogs are fed into the queue in the background so the API can start immediately. New uploads receive HTTP `503` while recovered jobs are still waiting to enter the queue.
+
 ## Limits and data flow
 
 - Default upload size is 200 MiB; expanded ZIP size is limited to 1 GiB.

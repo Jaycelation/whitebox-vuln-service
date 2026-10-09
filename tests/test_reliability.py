@@ -32,6 +32,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             'DATA_DIR': self.root,
             'DB_PATH': self.root / 'scans.sqlite3',
             'JOB_QUEUE': asyncio.Queue(maxsize=10),
+            'RECOVERING': False,
         }.items():
             patcher = patch.object(service, name, value)
             patcher.start()
@@ -151,6 +152,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.sleep(0)
                 self.assertFalse(task.done())
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
             finally:
                 release.set()
             with self.assertRaises(asyncio.CancelledError):
@@ -167,19 +171,53 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         (stale / 'work').mkdir()
         (stale / 'work' / 'semgrep.json').write_text('stale')
         processed = []
+        recovered = asyncio.Event()
 
         async def process(scan_id):
             self.assertFalse((service.job_dir(scan_id) / 'source').exists())
             self.assertFalse((service.job_dir(scan_id) / 'work').exists())
             processed.append(scan_id)
             service.update_scan(scan_id, status='completed')
+            if len(processed) == len(ids):
+                recovered.set()
 
         with patch.object(service, 'process_scan', side_effect=process):
             async with service.lifespan(service.app):
+                await asyncio.wait_for(recovered.wait(), timeout=5)
                 await asyncio.wait_for(service.JOB_QUEUE.join(), timeout=5)
         self.assertCountEqual(processed, ids)
         self.assertEqual(len(processed), 11)
         self.assertTrue(all(service.get_scan_row(scan_id)['status'] == 'completed' for scan_id in ids))
+
+    async def test_large_recovery_backlog_does_not_block_startup(self):
+        ids = [self.seed() for _ in range(12)]
+        running = asyncio.Event()
+
+        async def process(scan_id):
+            running.set()
+            await asyncio.Event().wait()
+
+        with patch.object(service, 'process_scan', side_effect=process):
+            context = service.lifespan(service.app)
+            await asyncio.wait_for(context.__aenter__(), timeout=1)
+            try:
+                await asyncio.wait_for(running.wait(), timeout=1)
+                self.assertTrue(service.RECOVERING)
+                # Recovery has priority even if a slot becomes available.
+                queued = service.JOB_QUEUE.get_nowait()
+                service.JOB_QUEUE.task_done()
+                upload = UploadFile(file=io.BytesIO(source_zip()))
+                try:
+                    with self.assertRaises(HTTPException) as rejected:
+                        await service.create_scan(upload, 'semgrep', 'new')
+                    self.assertEqual(rejected.exception.status_code, 503)
+                finally:
+                    service.JOB_QUEUE.put_nowait(queued)
+                    await upload.close()
+                self.assertTrue(all(service.get_scan_row(scan_id)['status'] == 'queued' for scan_id in ids))
+            finally:
+                await context.__aexit__(None, None, None)
+        self.assertFalse(service.RECOVERING)
 
     async def test_recovery_marks_missing_upload_failed(self):
         scan_id = self.seed()
