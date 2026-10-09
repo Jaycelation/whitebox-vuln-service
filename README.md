@@ -7,6 +7,7 @@ A self-hosted API that accepts a ZIP of source code, runs free scanners locally 
 | Scanner | What it checks |
 | --- | --- |
 | Semgrep Community Edition | Source patterns and common code security issues |
+| Dataflow (`dataflow`) | Request input that reaches a dangerous sink across functions and files, with a trace; built on Semgrep CE taint mode |
 | Gitleaks | Secrets in the uploaded working tree; matched secret values are redacted |
 | Trivy | Dependency vulnerabilities, configuration issues, and secrets |
 | OSV-Scanner | Known vulnerabilities in supported dependencies and lockfiles |
@@ -147,6 +148,31 @@ Other endpoints:
 
 Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, an automatic `fp_check`, and a `triage_status` that starts as `needs_review`. Dependency findings also carry `package`, `package_version`, and `aliases`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
 
+### Source-to-sink analysis
+
+Dependency scanners report vulnerable library versions, and Semgrep CE follows untrusted input only within a single function. The `dataflow` scanner (`whitebox_dataflow.py`) reports request input that reaches a dangerous sink through calls between functions and files. It runs Semgrep CE taint mode in stages:
+
+1. It finds functions whose parameter reaches a sink, such as `run_ping(target)` calling `os.system`. Calls to those functions, with tainted data in that parameter's position, then count as sinks.
+2. It finds functions that return request input. Calls to those functions then count as sources.
+3. It repeats both steps until no new functions appear (at most 8 rounds), so chains like controller → service → helper → sink are covered.
+4. A final pass reports request input that reaches a sink. Each finding has a `trace` of steps from source to sink. The dashboard shows the trace, and the SARIF export carries it as `codeFlows`.
+
+| | Covered |
+| --- | --- |
+| Languages | Python (Flask, Django, FastAPI), JavaScript/TypeScript (Express, Koa), Java (Servlet, Spring), PHP (plain, Laravel), Go (net/http, gin, echo), Ruby (Rails), C# (ASP.NET) |
+| Vulnerability classes | Command injection, code injection, SQL injection, path traversal, SSRF, unsafe deserialization, template injection/XSS, open redirect |
+
+Each class has sanitizers, such as `int()`, `shlex.quote`, `escapeshellarg`, `htmlspecialchars`, and `os.path.basename`. Constant strings never count as tainted. Functions that return an HTTP response are not treated as sources.
+
+Limits:
+
+- Functions are matched by name across the project, so two unrelated functions with the same name can produce a flow that does not exist. Very generic names like `get` and `run` only match plain calls, never method calls. Flows through summarized functions get `confidence: medium`, and flows within one function get `high`.
+- Validation in an `if` statement (an allow-list check, `is_numeric`) is not modeled, so validated input can still be reported. Data passed through globals across `include`/`require` of a dynamically built path (common in legacy PHP) is not followed.
+- Escaping functions are trusted even where they are insufficient, for example `mysqli_real_escape_string` around a number.
+- The default `.semgrepignore` skips `tests/`, `node_modules/`, vendored and minified files.
+
+The test fixtures in `tests/fixtures/dataflow/` hold 29 expected flows across the seven languages, including two-level chains, source wrappers, methods, and sanitized or constant inputs that must not be reported. The suite requires an exact match. On intentionally vulnerable open-source apps it found, for example, DVWA's command injection, SQL injection, and open redirect at low/medium/high, NodeGoat's `eval` injection and SSRF, and pygoat's `pickle` deserialization, `eval`, raw SQL, and SSRF.
+
 ### False-positive checks
 
 While the source is still extracted, each finding gets `fp_check`: a `verdict`, the `reasons` for it, and `duplicate_of` when it repeats another finding. The check only advises. It never changes `triage_status` and never hides a finding.
@@ -199,4 +225,4 @@ python -m pip install -r requirements.txt -e .
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, and the metrics endpoint. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, the metrics endpoint, false-positive checks and triage, and source-to-sink analysis. The dataflow tests run Semgrep when it is installed (CI installs it) and are skipped otherwise. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.

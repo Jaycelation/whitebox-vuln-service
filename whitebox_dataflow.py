@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-MAX_ROUNDS = 5
+MAX_ROUNDS = 8
 SKIP_DIRECTORIES = frozenset({".git", "node_modules", "vendor", "third_party", "bower_components", ".venv", "venv", "site-packages", "dist", "build", "target", "__pycache__"})
 # Calls like obj.get(x) are far too common to treat as a summarized helper.
 GENERIC_NAMES = frozenset({
@@ -42,6 +42,14 @@ GENERIC_NAMES = frozenset({
     "toString", "to_s", "String", "valueOf", "equals", "hash", "Get", "Set", "Run", "Exec", "Do", "Write", "Read",
 })
 
+# A function that returns one of these builds an HTTP response; it is a view,
+# not a helper that hands request data to its caller.
+RESPONSE_CALLS = {
+    "python": ["render(...)", "render_template(...)", "HttpResponse(...)", "JsonResponse(...)", "jsonify(...)", "redirect(...)",
+               "Response(...)", "make_response(...)", "HttpResponseRedirect(...)", "TemplateResponse(...)"],
+    "javascript": ["$RES.send(...)", "$RES.json(...)", "$RES.render(...)", "$RES.redirect(...)", "$RES.status(...).send(...)", "$RES.status(...).json(...)"],
+    "php": ["view(...)", "response(...)", "redirect(...)", "response()->json(...)"],
+}
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Language keywords and constructors can bind as a "function name" but are not
 # callable by name; a pattern like `echo(...)` would not even parse.
@@ -228,11 +236,11 @@ LANGUAGES: dict[str, Language] = {
         sinks={
             "command-injection": ["Runtime.getRuntime().exec($X, ...)", "$RT.exec($X, ...)", "new ProcessBuilder($X, ...)", "new ProcessBuilder(..., $X, ...)", "$PB.command($X, ...)"],
             "code-injection": ["$ENGINE.eval($X, ...)", "$PARSER.parseExpression($X, ...)", "Ognl.getValue($X, ...)", "$GROOVY.evaluate($X, ...)", "MVEL.eval($X, ...)"],
-            "sql-injection": ["$STMT.executeQuery($X, ...)", "$STMT.executeUpdate($X, ...)", "$STMT.execute($X, ...)", "$STMT.addBatch($X)", "$CONN.prepareStatement($X, ...)", "$CONN.prepareCall($X, ...)", "$EM.createQuery($X, ...)", "$EM.createNativeQuery($X, ...)", "$JDBC.query($X, ...)", "$JDBC.queryForObject($X, ...)", "$JDBC.queryForList($X, ...)", "$JDBC.queryForMap($X, ...)", "$JDBC.update($X, ...)", "$JDBC.batchUpdate($X, ...)", "$SESSION.createSQLQuery($X, ...)"],
+            "sql-injection": ["$STMT.executeQuery($X, ...)", "$STMT.executeUpdate($X, ...)", "(Statement $STMT).execute($X, ...)", "(Statement $STMT).addBatch($X)", "$CONN.createStatement().execute($X, ...)", "$CONN.prepareStatement($X, ...)", "$CONN.prepareCall($X, ...)", "$EM.createQuery($X, ...)", "$EM.createNativeQuery($X, ...)", "(JdbcTemplate $JDBC).query($X, ...)", "$JDBC.queryForObject($X, ...)", "$JDBC.queryForList($X, ...)", "$JDBC.queryForMap($X, ...)", "(JdbcTemplate $JDBC).update($X, ...)", "(JdbcTemplate $JDBC).batchUpdate($X, ...)", "$SESSION.createSQLQuery($X, ...)"],
             "path-traversal": ["new File($X)", "new File($PARENT, $X)", "new FileInputStream($X)", "new FileOutputStream($X, ...)", "new FileReader($X)", "new FileWriter($X, ...)", "new RandomAccessFile($X, ...)", "Paths.get($X, ...)", "Path.of($X, ...)", "Paths.get($ROOT, $X)", "$P.resolve($X)"],
-            "ssrf": ["new URL($X)", "URI.create($X)", "new URI($X)", "$REST.getForObject($X, ...)", "$REST.getForEntity($X, ...)", "$REST.postForObject($X, ...)", "$REST.postForEntity($X, ...)", "$REST.exchange($X, ...)", "HttpRequest.newBuilder($X)", "$BUILDER.uri($X)", "new HttpGet($X)", "new HttpPost($X)", "Jsoup.connect($X)"],
+            "ssrf": ["$X.openConnection(...)", "$X.openStream()", "new URL($X).openConnection(...)", "new URL($X).openStream()", "$REST.getForObject($X, ...)", "$REST.getForEntity($X, ...)", "$REST.postForObject($X, ...)", "$REST.postForEntity($X, ...)", "$REST.exchange($X, ...)", "HttpRequest.newBuilder($X)", "$BUILDER.uri($X)", "new HttpGet($X)", "new HttpPost($X)", "Jsoup.connect($X)"],
             "deserialization": ["new ObjectInputStream($X)", "new XMLDecoder($X, ...)", "$XSTREAM.fromXML($X, ...)", "$YAML.load($X)", "$MAPPER.enableDefaultTyping(...).readValue($X, ...)", "SerializationUtils.deserialize($X)"],
-            "template-injection": ["$RESP.getWriter().write($X)", "$RESP.getWriter().print($X)", "$RESP.getWriter().println($X)", "$OUT.println($X)", "Velocity.evaluate($CTX, $W, $TAG, $X)", "new Template($NAME, new StringReader($X), ...)"],
+            "template-injection": ["$RESP.getWriter().write($X)", "$RESP.getWriter().print($X)", "$RESP.getWriter().println($X)", {"patterns": [{"pattern": "$OUT.println($X)"}, {"metavariable-regex": {"metavariable": "$OUT", "regex": "^(out|writer|pw|printWriter|respWriter)$"}}]}, "Velocity.evaluate($CTX, $W, $TAG, $X)", "new Template($NAME, new StringReader($X), ...)"],
             "open-redirect": ["$RESP.sendRedirect($X)", "new ModelAndView(\"redirect:\" + $X)", "new RedirectView($X, ...)"],
         },
         sanitizers={
@@ -564,7 +572,9 @@ def build_source_rules(languages: list[str], summaries: dict[str, Summary]) -> l
     rules = []
     for name in languages:
         language = LANGUAGES[name]
-        returns = [{"patterns": [{"pattern-inside": definition}, {"pattern": statement}, {"focus-metavariable": "$X"}]}
+        end = ";" if name == "php" else ""
+        not_responses = [{"pattern-not": f"return {call}{end}"} for call in RESPONSE_CALLS.get(name, [])]
+        returns = [{"patterns": [{"pattern-inside": definition}, {"pattern": statement}, *not_responses, {"focus-metavariable": "$X"}]}
                    for definition in language.functions for statement in language.returns]
         rules.append({"id": f"source.{name}", "mode": "taint", "languages": language.semgrep, "severity": "INFO",
                       "message": "SRC|$FUNC", "pattern-sources": _sources(language, summaries), "pattern-sinks": returns})
