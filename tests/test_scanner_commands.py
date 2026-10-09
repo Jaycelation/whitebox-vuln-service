@@ -23,3 +23,25 @@ class ScannerCommandTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OsvNoManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def run_fake_osv(self, message):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        script = f'import sys; sys.stderr.write({message!r}); sys.exit(128)'
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with patch.object(service, 'DATA_DIR', work), \
+                 patch.object(service, 'scanner_command', return_value=[sys.executable, '-c', script]):
+                result, findings = await service.run_scanner('osv-scanner', work, work)
+        return result, findings
+
+    async def test_project_without_manifests_is_not_a_failure(self):
+        result, findings = await self.run_fake_osv('No package sources found, --help for usage information.\n')
+        self.assertEqual((result['status'], result['error'], findings), ('completed', None, []))
+
+    async def test_other_exit_128_errors_still_fail(self):
+        result, _ = await self.run_fake_osv('fatal: database download failed\n')
+        self.assertEqual(result['status'], 'failed')
