@@ -507,7 +507,7 @@ def parse_joern(path: Path, source_root: Path) -> list[dict[str, Any]]:
 def scanner_command(name: str, source_root: Path, raw_output: Path) -> list[str]:
     binary = SCANNER_BINARIES[name]
     if name == "semgrep":
-        return [binary, "scan", "--config", "auto", "--json", "--output", str(raw_output), "--metrics=off", "--timeout", "30", "--jobs", "2", str(source_root)]
+        return [binary, "scan", "--config", "p/default", "--json", "--output", str(raw_output), "--metrics=off", "--timeout", "30", "--jobs", "2", str(source_root)]
     if name == "gitleaks":
         return [binary, "dir", "--no-banner", "--no-color", "--redact=100", "--exit-code", "0", "--report-format", "json", "--report-path", str(raw_output), str(source_root)]
     if name == "trivy":

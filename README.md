@@ -127,7 +127,7 @@ Larger recovery backlogs are fed into the queue in the background so the API can
 - Each scanner has a 15-minute timeout by default.
 - ZIP traversal paths, duplicate paths, encrypted entries, and symlinks are rejected.
 - The scanner container runs as an unprivileged user with all Linux capabilities dropped and a read-only root filesystem.
-- Semgrep `auto`, Trivy vulnerability data, and OSV vulnerability matching can require internet access. Scanners do not receive credentials from this service.
+- Semgrep's `p/default` rules, Trivy vulnerability data, and OSV vulnerability matching can require internet access. Semgrep uses an explicit ruleset because `auto` is incompatible with `--metrics=off` in the pinned version. Scanners do not receive credentials from this service.
 - Semgrep-maintained rules have usage restrictions. This configuration is for your own internal, self-hosted use; do not offer it as a competing or hosted SaaS scanner without checking the rule license and obtaining the required rights.
 - This is static analysis and dependency checking, not proof that a finding is exploitable. Reports need human validation.
 
