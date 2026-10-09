@@ -145,7 +145,7 @@ Other endpoints:
 
 Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, and `triage_status: needs_review`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
 
-Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
+Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Expired jobs are removed at startup and then every hour in the background; set `PRUNE_INTERVAL_SECONDS` to change the interval. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
 
 `completed` means every requested scanner completed; `partial` means some completed and some failed or timed out. If none completed, the job is `failed`, and its report still contains scanner diagnostics and any parsed findings. A failure before scanner execution (such as an extraction error) has no report; check the scan's `error` field.
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,14 @@ from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPExcepti
 from fastapi.responses import JSONResponse
 
 
+def positive_int_setting(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    value = int(raw) if raw else default
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "scans.sqlite3"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
@@ -30,6 +39,7 @@ MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "20000"))
 MAX_FINDINGS = int(os.getenv("MAX_FINDINGS", "10000"))
 SCAN_TIMEOUT_SECONDS = int(os.getenv("SCAN_TIMEOUT_SECONDS", "900"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
+PRUNE_INTERVAL_SECONDS = positive_int_setting("PRUNE_INTERVAL_SECONDS", 3600)
 API_KEY = os.getenv("API_KEY", "")
 DEFAULT_SCANNERS = ("semgrep", "gitleaks", "trivy", "osv-scanner")
 SCANNER_BINARIES = {
@@ -43,6 +53,7 @@ SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secret", "dependency", "misconfiguration")
 JOB_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 RECOVERING = False
+LOGGER = logging.getLogger("whitebox")
 
 
 async def complete_thread_work(function: Any, *args: Any) -> Any:
@@ -87,9 +98,22 @@ def initialize_storage() -> None:
                 finished_at TEXT,
                 scanners_json TEXT NOT NULL,
                 upload_bytes INTEGER NOT NULL,
-                error TEXT
+                error TEXT,
+                summary_json TEXT,
+                scanner_results_json TEXT
             )"""
         )
+        # Databases created before summaries were stored are upgraded in place.
+        existing = {column["name"] for column in db.execute("PRAGMA table_info(scans)")}
+        for column in ("summary_json", "scanner_results_json"):
+            if column not in existing:
+                try:
+                    db.execute(f"ALTER TABLE scans ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
+        db.execute("CREATE INDEX IF NOT EXISTS scans_status_created_at ON scans (status, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS scans_created_at ON scans (created_at)")
 
 
 def job_dir(scan_id: str) -> Path:
@@ -104,8 +128,12 @@ def get_scan_row(scan_id: str) -> sqlite3.Row | None:
 
 
 def update_scan(scan_id: str, **fields: Any) -> None:
-    allowed = {"status", "updated_at", "finished_at", "error"}
-    if not fields or not set(fields).issubset(allowed):
+    allowed = {"status", "updated_at", "finished_at", "error", "summary_json", "scanner_results_json"}
+    unknown = set(fields) - allowed
+    if unknown:
+        # Dropping the whole update would silently lose status changes too.
+        raise ValueError(f"Unsupported scan fields: {', '.join(sorted(unknown))}")
+    if not fields:
         return
     names = list(fields)
     assignments = ", ".join(f"{name} = ?" for name in names)
@@ -135,6 +163,11 @@ def public_scan(row: sqlite3.Row, *, include_summary: bool = True) -> dict[str, 
         "error": row["error"],
     }
     if include_summary:
+        if row["summary_json"] is not None:
+            result["summary"] = json.loads(row["summary_json"])
+            result["scanner_results"] = json.loads(row["scanner_results_json"] or "null")
+            return result
+        # Rows finished before summaries were stored: read the report once, then backfill.
         report_path = job_dir(row["id"]) / "report.json"
         if report_path.is_file():
             try:
@@ -143,7 +176,17 @@ def public_scan(row: sqlite3.Row, *, include_summary: bool = True) -> dict[str, 
                 result["scanner_results"] = report.get("scanners")
             except (OSError, json.JSONDecodeError):
                 result["summary"] = None
+            else:
+                store_report_summary(row["id"], result["summary"], result["scanner_results"])
     return result
+
+
+def store_report_summary(scan_id: str, summary: Any, scanner_results: Any) -> None:
+    with connect_db() as db:
+        db.execute(
+            "UPDATE scans SET summary_json = ?, scanner_results_json = ? WHERE id = ? AND summary_json IS NULL",
+            (json.dumps(summary), json.dumps(scanner_results), scan_id),
+        )
 
 
 def validate_zip_archive(path: Path) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
@@ -678,7 +721,15 @@ async def process_scan(scan_id: str) -> None:
             status = "partial"
         else:
             status = "failed"
-        update_scan(scan_id, status=status, updated_at=utc_now(), finished_at=utc_now(), error=None)
+        update_scan(
+            scan_id,
+            status=status,
+            updated_at=utc_now(),
+            finished_at=utc_now(),
+            error=None,
+            summary_json=json.dumps(report["summary"]),
+            scanner_results_json=json.dumps(scanners),
+        )
     except asyncio.CancelledError:
         interrupted = True
         update_scan(scan_id, status="queued", updated_at=utc_now(), error="Service restarted while this scan was running.")
@@ -728,15 +779,30 @@ def recover_and_prune() -> list[str]:
     return pending
 
 
-def prune_expired() -> None:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+def prune_expired() -> int:
+    # utc_now() is the only writer of created_at and produces fixed-width UTC
+    # ISO-8601 text, so string order is time order and the index can be used.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
     with connect_db() as db:
-        rows = db.execute("SELECT * FROM scans ORDER BY created_at").fetchall()
-        for row in rows:
-            created = datetime.fromisoformat(row["created_at"])
-            if row["status"] in ("completed", "partial", "failed") and created < cutoff:
-                shutil.rmtree(job_dir(row["id"]), ignore_errors=True)
-                db.execute("DELETE FROM scans WHERE id = ?", (row["id"],))
+        rows = db.execute(
+            "SELECT id FROM scans WHERE status IN ('completed', 'partial', 'failed') AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+    # Remove files outside any write transaction so slow disks never block other writers.
+    for row in rows:
+        shutil.rmtree(job_dir(row["id"]), ignore_errors=True)
+        with connect_db() as db:
+            db.execute("DELETE FROM scans WHERE id = ?", (row["id"],))
+    return len(rows)
+
+
+async def prune_periodically() -> None:
+    while True:
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
+        try:
+            await complete_thread_work(prune_expired)
+        except Exception:
+            LOGGER.exception("Pruning expired scans failed; retrying in %s seconds", PRUNE_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
@@ -758,13 +824,15 @@ async def lifespan(_: FastAPI):
 
     worker = asyncio.create_task(queue_worker(), name="whitebox-scan-worker")
     recovery = asyncio.create_task(feed_recovered_jobs(), name="whitebox-queue-recovery")
+    pruner = asyncio.create_task(prune_periodically(), name="whitebox-pruner")
     try:
         # Even an oversized durable backlog must not block API startup.
         yield
     finally:
-        recovery.cancel()
-        with suppress(asyncio.CancelledError):
-            await recovery
+        for task in (recovery, pruner):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
@@ -858,7 +926,6 @@ async def create_scan(
     scanners: str = Form(",".join(DEFAULT_SCANNERS), description="Comma-separated scanner names"),
     name: str = Form("source-upload", max_length=100),
 ) -> dict[str, Any]:
-    prune_expired()
     requested = list(dict.fromkeys(part.strip() for part in scanners.split(",") if part.strip()))
     if not requested:
         raise HTTPException(status_code=422, detail="Select at least one scanner")
