@@ -714,6 +714,16 @@ def parse_scanner_output(name: str, raw_output: Path, source_root: Path) -> list
     return parsers[name](data, source_root)
 
 
+def osv_found_no_manifests(stderr_path: Path) -> bool:
+    try:
+        with stderr_path.open("rb") as handle:
+            handle.seek(max(stderr_path.stat().st_size - 4096, 0))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "No package sources found" in tail
+
+
 async def terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -776,6 +786,12 @@ async def run_scanner(name: str, source_root: Path, work_dir: Path) -> tuple[dic
             [],
         )
 
+    if name == "osv-scanner" and process.returncode == 128 and osv_found_no_manifests(stderr_path):
+        # A project without dependency manifests has nothing for OSV to check; that is not a failure.
+        return (
+            {"name": name, "status": "completed", "exit_code": process.returncode, "duration_seconds": round(time.monotonic() - started, 2), "finding_count": 0, "error": None, "note": "No dependency manifests or lockfiles found."},
+            [],
+        )
     try:
         findings = parse_scanner_output(name, raw_output, source_root)
     except (OSError, ValueError, TypeError, AttributeError, KeyError):
