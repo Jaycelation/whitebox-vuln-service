@@ -50,7 +50,7 @@ RUN if [ "$INSTALL_JOERN" = "1" ]; then \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt "semgrep==${SEMGREP_VERSION}"
-COPY app.py whitebox_dataflow.py /app/
+COPY app.py whitebox_dataflow.py whitebox_evidence.py /app/
 COPY web /app/web
 
 RUN groupadd --system scanner \
