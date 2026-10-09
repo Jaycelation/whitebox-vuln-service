@@ -61,9 +61,11 @@ curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report
 | Parameter | Description |
 | --- | --- |
 | `severity` | Comma-separated: `critical`, `high`, `medium`, `low`, `info`, `unknown` |
-| `tool` | Comma-separated: `semgrep`, `gitleaks`, `trivy`, `osv-scanner`, `joern` |
+| `tool` | Comma-separated: `semgrep`, `dataflow`, `gitleaks`, `trivy`, `osv-scanner`, `joern` |
 | `category` | Comma-separated: `sast`, `secret`, `dependency`, `misconfiguration` |
 | `path_contains` | Case-insensitive substring match on a finding's `path` |
+| `triage_status` | Comma-separated: `needs_review`, `confirmed`, `false_positive`, `accepted_risk`, `fixed` |
+| `fp_verdict` | Comma-separated: `needs_review`, `likely_false_positive`, `duplicate` |
 | `limit`, `offset` | Paginate the matched findings |
 
 An unknown `severity`, `tool`, or `category` value returns `422` with the offending values listed.
