@@ -98,7 +98,7 @@ Install the adapter from this repository with [uv](https://docs.astral.sh/uv/):
 uv tool install --editable .
 ```
 
-The package provides four MCP tools: `whitebox_list_scanners`, `whitebox_scan_repository`, `whitebox_scan_status`, and `whitebox_get_report`. `whitebox_scan_repository` defaults to Semgrep, Gitleaks, Trivy, and OSV-Scanner. Its `standard_plus_joern` profile adds Joern and requires `INSTALL_JOERN=1` in the service's `.env`, followed by an image rebuild. That profile runs the installed Joern query set; it does not add custom framework-specific source/sink models.
+The package provides five MCP tools: `whitebox_list_scanners`, `whitebox_scan_repository`, `whitebox_scan_status`, `whitebox_get_report`, and `whitebox_triage_finding`. An agent can read a finding's `fp_check`, check the source itself, and record a false-positive or confirmed verdict with its evidence. `whitebox_scan_repository` defaults to Semgrep, Gitleaks, Trivy, and OSV-Scanner. Its `standard_plus_joern` profile adds Joern and requires `INSTALL_JOERN=1` in the service's `.env`, followed by an image rebuild. That profile runs the installed Joern query set; it does not add custom framework-specific source/sink models.
 
 ### Claude Code
 
@@ -139,12 +139,33 @@ Other endpoints:
 - `GET /api/scanners` lists installed scanners.
 - `GET /api/scans?limit=50` lists recent jobs.
 - `GET /api/metrics` returns Prometheus text-format metrics: queue depth, stored scans by status, active scans and scanner processes, and scan and scanner run counts and durations. It uses the same bearer token as the other `/api` endpoints. Counts and durations cover the running process and reset when the service restarts.
+- `PATCH /api/scans/{id}/findings/{finding_id}` records a triage decision; see [Recording triage decisions](#recording-triage-decisions).
 - `DELETE /api/scans/{id}` removes a finished job and its report.
 - `GET /health` is an unauthenticated health check.
 
 ## Report shape and triage
 
-Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, and `triage_status: needs_review`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
+Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, an automatic `fp_check`, and a `triage_status` that starts as `needs_review`. Dependency findings also carry `package`, `package_version`, and `aliases`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
+
+### False-positive checks
+
+While the source is still extracted, each finding gets `fp_check`: a `verdict`, the `reasons` for it, and `duplicate_of` when it repeats another finding. The check only advises. It never changes `triage_status` and never hides a finding.
+
+| Verdict | When |
+| --- | --- |
+| `likely_false_positive` | The file is test code or a fixture, or an example, template, or documentation file. The finding's line has a suppression comment (`nosec`, `noqa`, `nosemgrep`, `gitleaks:allow`, `trivy:ignore`, `NOSONAR`, `pragma: allowlist secret`), or a comment line directly above it does. For secrets: the value looks like a placeholder or documentation example, or it is read from the environment or a template variable. |
+| `duplicate` | Another finding was reported first for the same package version and vulnerability, matching CVE, GHSA, and PYSEC IDs through their aliases. A secret at the same file and line also counts; Gitleaks and Trivy usually both report it. |
+| `needs_review` | No signal. Findings in vendored or generated files keep this verdict, with a reason noting where they are. |
+
+On a project with three pinned Python dependencies, OSV-Scanner and Trivy together reported 170 dependency findings for 68 distinct vulnerabilities. The other 102 are marked `duplicate`. Source lines are read only to compute these checks and are not stored.
+
+Use `GET /api/scans/{id}/report?fp_verdict=needs_review` to list only findings without a false-positive signal, or `triage_status=false_positive` to list decisions.
+
+### Recording triage decisions
+
+`PATCH /api/scans/{id}/findings/{finding_id}` with `{"status": "...", "note": "..."}` records a decision. Status is one of `false_positive`, `confirmed`, `accepted_risk`, `fixed`, or `needs_review` (which clears the decision). The decision also covers the finding's duplicates, updates the stored report and summary, and is applied automatically to later scans with the same `name`.
+
+Later scans match code findings by rule, file, and the whitespace-normalized text of the flagged line, so a decision survives code moving to another line. Secrets are matched by rule, file, and line number, and no hash of a secret-bearing line is stored. Dependency findings are matched by rule, manifest, and package. In the SARIF export, `false_positive` and `accepted_risk` results carry a SARIF `suppressions` entry with the note as justification, so GitHub code scanning dismisses them. Heuristic verdicts alone are never suppressed. The MCP adapter exposes this as `whitebox_triage_finding`, and `whitebox_get_report` accepts `fp_verdict` and `triage_status` filters.
 
 Source archives are removed after a scan. Normalized reports and metadata remain in the `scanner-data` Docker volume for 30 days by default; set `RETENTION_DAYS` to adjust this. Expired jobs are removed at startup and then every hour in the background; set `PRUNE_INTERVAL_SECONDS` to change the interval. Delete a job explicitly through the API or remove all stored data with `docker compose down -v`.
 

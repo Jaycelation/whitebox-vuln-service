@@ -11,6 +11,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import threading
 import time
 import uuid
 import zipfile
@@ -21,6 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
 
 def positive_int_setting(name: str, default: int) -> int:
@@ -168,6 +170,19 @@ def initialize_storage() -> None:
                         raise
         db.execute("CREATE INDEX IF NOT EXISTS scans_status_created_at ON scans (status, created_at)")
         db.execute("CREATE INDEX IF NOT EXISTS scans_created_at ON scans (created_at)")
+        # Decisions are per project (the scan name) and match findings by match_key.
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS triage_decisions (
+                project TEXT NOT NULL,
+                match_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                note TEXT,
+                updated_at TEXT NOT NULL,
+                scan_id TEXT,
+                finding_id TEXT,
+                PRIMARY KEY (project, match_key)
+            )"""
+        )
 
 
 def job_dir(scan_id: str) -> Path:
@@ -357,6 +372,9 @@ def make_finding(
     rule_id: Any = None,
     confidence: Any = None,
     references: Any = None,
+    package: Any = None,
+    package_version: Any = None,
+    aliases: Any = None,
     source_root: Path,
 ) -> dict[str, Any]:
     try:
@@ -390,6 +408,11 @@ def make_finding(
         str(finding[key] or "") for key in ("tool", "rule_id", "path", "line", "title")
     )
     finding["id"] = hashlib.sha256(fingerprint.encode("utf-8", "replace")).hexdigest()[:24]
+    # Package details let dependency findings from different scanners be matched.
+    if package:
+        finding["package"] = clean_text(package, 200)
+        finding["package_version"] = clean_text(package_version, 100) or None
+        finding["aliases"] = sorted({clean_text(alias, 100) for alias in aliases or [] if isinstance(alias, str) and alias})[:20]
     return finding
 
 
@@ -464,6 +487,9 @@ def parse_trivy(data: Any, source_root: Path) -> list[dict[str, Any]]:
                     line=None,
                     rule_id=vuln_id,
                     references=refs,
+                    package=item.get("PkgName"),
+                    package_version=item.get("InstalledVersion"),
+                    aliases=item.get("VendorIDs"),
                     source_root=source_root,
                 )
             )
@@ -564,6 +590,9 @@ def parse_osv(data: Any, source_root: Path) -> list[dict[str, Any]]:
                         path=source_path,
                         rule_id=vuln_id,
                         references=refs,
+                        package=package.get("name"),
+                        package_version=package.get("version"),
+                        aliases=aliases,
                         source_root=source_root,
                     )
                 )
@@ -783,6 +812,167 @@ def summarize(findings: list[dict[str, Any]], scanners: list[dict[str, Any]]) ->
     }
 
 
+# False-positive checks only advise. They set fp_check on a finding and never
+# change triage_status, which only a person or an agent may set.
+TEST_DIRECTORIES = frozenset({"test", "tests", "__tests__", "testing", "spec", "specs", "testdata", "test_data", "fixture", "fixtures", "mocks", "__mocks__"})
+EXAMPLE_DIRECTORIES = frozenset({"example", "examples", "sample", "samples", "demo", "demos", "doc", "docs"})
+VENDORED_DIRECTORIES = frozenset({"node_modules", "vendor", "third_party", "third-party", "bower_components", "site-packages", ".venv", "venv"})
+TEST_FILE = re.compile(r"(^test_.+\.py$|_test\.(py|go)$|\.(test|spec)\.[cm]?[jt]sx?$|Tests?\.(java|kt|cs)$)")
+EXAMPLE_FILE = re.compile(r"(\.(example|sample|template|dist)$|\.md$|\.rst$)", re.IGNORECASE)
+GENERATED_FILE = re.compile(r"\.(min\.js|min\.css|bundle\.js|map)$", re.IGNORECASE)
+PLACEHOLDER_MARKERS = ("example", "dummy", "placeholder", "changeme", "change_me", "your_", "your-", "<your", "xxxx", "fake", "redacted", "insert_")
+ENVIRONMENT_MARKERS = ("os.environ", "getenv(", "process.env", "env(", "${", "{{")
+SUPPRESSION_MARKERS = ("nosec", "noqa", "nosemgrep", "gitleaks:allow", "trivy:ignore", "nosonar", "lgtm[", "pragma: allowlist secret")
+TRIAGE_STATUSES = ("needs_review", "confirmed", "false_positive", "accepted_risk", "fixed")
+FP_VERDICTS = ("needs_review", "likely_false_positive", "duplicate")
+MAX_CONTEXT_FILE_BYTES = 5 * 1024 * 1024
+
+
+def path_kind(path: str) -> str | None:
+    parts = [part.lower() for part in PurePosixPath(path).parts]
+    name = PurePosixPath(path).name
+    if any(part in VENDORED_DIRECTORIES for part in parts[:-1]):
+        return "vendored"
+    if any(part in TEST_DIRECTORIES for part in parts[:-1]) or TEST_FILE.search(name):
+        return "test"
+    if any(part in EXAMPLE_DIRECTORIES for part in parts[:-1]) or EXAMPLE_FILE.search(name):
+        return "example"
+    if GENERATED_FILE.search(name):
+        return "generated"
+    return None
+
+
+class SourceLines:
+    """Read finding lines from the extracted source; never follows paths outside it."""
+
+    def __init__(self, source_root: Path) -> None:
+        self.root = source_root.resolve()
+        self.files: dict[str, list[str] | None] = {}
+
+    def get(self, path: str | None, line: int | None) -> str | None:
+        if not path or not line:
+            return None
+        if path not in self.files:
+            self.files[path] = None
+            target = (self.root / path).resolve()
+            if target.is_relative_to(self.root) and target.is_file() and target.stat().st_size <= MAX_CONTEXT_FILE_BYTES:
+                with suppress(OSError):
+                    self.files[path] = target.read_text("utf-8", errors="replace").splitlines()
+        lines = self.files[path]
+        if lines is None or not 1 <= line <= len(lines):
+            return None
+        return lines[line - 1]
+
+
+def finding_match_key(finding: dict[str, Any], line_text: str | None = None) -> str:
+    """Key that recognizes the same finding in a later scan of the project."""
+    base = [finding.get("tool"), finding.get("rule_id"), finding.get("path")]
+    if finding.get("category") == "dependency":
+        parts = [*base, (finding.get("package") or "").lower()]
+    elif finding.get("category") != "secret" and line_text is not None and line_text.strip():
+        # Code content survives edits that move the line. Secrets are keyed by
+        # position instead, so no hash of a secret-bearing line is stored.
+        parts = [*base, " ".join(line_text.split())]
+    else:
+        parts = [*base, finding.get("line")]
+    return hashlib.sha256("|".join(str(part or "") for part in parts).encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def check_false_positives(findings: list[dict[str, Any]], source_root: Path) -> None:
+    """Add fp_check and match_key to each finding while the source is still extracted."""
+    lines = SourceLines(source_root)
+    canonical: dict[tuple[str, str, str], str] = {}
+    for finding in findings:
+        reasons: list[str] = []
+        likely_false = False
+        path = finding.get("path") or ""
+        category = finding.get("category")
+        line_text = lines.get(path, finding.get("line"))
+        kind = path_kind(path) if path else None
+        if kind in ("test", "example"):
+            likely_false = True
+            reasons.append("In test code or fixtures." if kind == "test" else "In an example, template or documentation file.")
+        elif kind == "vendored":
+            reasons.append("In vendored third-party code; fix it upstream or by updating the dependency.")
+        elif kind == "generated":
+            reasons.append("In a generated or minified file; review the source it was built from.")
+        if line_text is not None:
+            lowered = line_text.lower()
+            nearby = lowered
+            previous = (lines.get(path, finding["line"] - 1) or "").strip().lower()
+            # A marker on the line above counts only on a comment line of its own,
+            # not as a trailing comment that belongs to the previous statement.
+            if previous.startswith(("#", "//", "/*", "*", "--")):
+                nearby += "\n" + previous
+            suppression = next((marker for marker in SUPPRESSION_MARKERS if marker in nearby), None)
+            if suppression:
+                likely_false = True
+                reasons.append(f"Suppressed inline with '{suppression}'.")
+            if category == "secret":
+                if any(marker in lowered for marker in PLACEHOLDER_MARKERS):
+                    likely_false = True
+                    reasons.append("The value looks like a placeholder or documentation example.")
+                elif any(marker in lowered for marker in ENVIRONMENT_MARKERS):
+                    likely_false = True
+                    reasons.append("The value is read from the environment or a template variable.")
+        verdict = "likely_false_positive" if likely_false else "needs_review"
+        duplicate_of = None
+        if category == "dependency" and finding.get("package"):
+            package = (finding["package"].lower(), finding.get("package_version") or "")
+            keys = [(*package, identifier) for identifier in {finding.get("rule_id"), *finding.get("aliases", [])} if identifier]
+            duplicate_of = next((canonical[key] for key in keys if key in canonical), None)
+            for key in keys:
+                canonical.setdefault(key, duplicate_of or finding["id"])
+            if duplicate_of:
+                verdict = "duplicate"
+                reasons.append(f"Same vulnerability and package version as finding {duplicate_of}.")
+        elif category == "secret" and path and finding.get("line"):
+            # Gitleaks and Trivy both report most secrets; one decision should cover both.
+            key = ("secret", path, str(finding["line"]))
+            duplicate_of = canonical.setdefault(key, finding["id"])
+            if duplicate_of != finding["id"]:
+                verdict = "duplicate"
+                reasons.append(f"Same secret location as finding {duplicate_of}.")
+            else:
+                duplicate_of = None
+        finding["fp_check"] = {"verdict": verdict, "reasons": reasons, "duplicate_of": duplicate_of}
+        finding["match_key"] = finding_match_key(finding, line_text)
+
+
+def triage_summary(findings: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    verdicts = dict.fromkeys(FP_VERDICTS, 0)
+    statuses = dict.fromkeys(TRIAGE_STATUSES, 0)
+    for finding in findings:
+        verdict = (finding.get("fp_check") or {}).get("verdict", "needs_review")
+        verdicts[verdict] = verdicts.get(verdict, 0) + 1
+        status = finding.get("triage_status", "needs_review")
+        statuses[status] = statuses.get(status, 0) + 1
+    return {"fp_check": verdicts, "triage": statuses}
+
+
+def apply_triage_decisions(project: str, findings: list[dict[str, Any]]) -> None:
+    """Carry triage decisions made on earlier scans of the same project forward."""
+    keys = [finding["match_key"] for finding in findings if finding.get("match_key")]
+    if not keys:
+        return
+    decisions: dict[str, sqlite3.Row] = {}
+    with connect_db() as db:
+        for start in range(0, len(keys), 500):
+            chunk = keys[start : start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            for row in db.execute(
+                f"SELECT * FROM triage_decisions WHERE project = ? AND match_key IN ({placeholders})", (project, *chunk)
+            ):
+                decisions[row["match_key"]] = row
+    for finding in findings:
+        decision = decisions.get(finding.get("match_key"))
+        if decision is not None:
+            finding["triage_status"] = decision["status"]
+            finding["triage_note"] = decision["note"]
+            finding["triage_updated_at"] = decision["updated_at"]
+            finding["triage_source"] = "earlier_scan"
+
+
 async def process_scan(scan_id: str) -> None:
     row = get_scan_row(scan_id)
     if row is None:
@@ -812,6 +1002,9 @@ async def process_scan(scan_id: str) -> None:
                 if len(findings) < MAX_FINDINGS:
                     findings.append(finding)
         truncated = len(seen) > len(findings)
+        # Runs before cleanup because some checks read the finding's source line.
+        await complete_thread_work(check_false_positives, findings, source_root)
+        apply_triage_decisions(row["name"], findings)
         report = {
             "scan_id": scan_id,
             "created_at": row["created_at"],
@@ -822,6 +1015,7 @@ async def process_scan(scan_id: str) -> None:
             "triage_note": "Scanner output is candidate evidence. Review each result in source context before treating it as a vulnerability.",
         }
         report["summary"]["findings_truncated"] = truncated
+        report["summary"].update(triage_summary(findings))
         report_path = directory / "report.json"
         temporary_report = directory / "report.json.tmp"
         temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
@@ -1225,10 +1419,16 @@ def filter_findings(
     tool: set[str] | None,
     category: set[str] | None,
     path_contains: str | None,
+    triage_status: set[str] | None = None,
+    fp_verdict: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     needle = path_contains.lower() if path_contains else None
     selected = []
     for finding in findings:
+        if triage_status is not None and finding.get("triage_status", "needs_review") not in triage_status:
+            continue
+        if fp_verdict is not None and (finding.get("fp_check") or {}).get("verdict", "needs_review") not in fp_verdict:
+            continue
         if severity is not None and finding.get("severity") not in severity:
             continue
         if tool is not None and finding.get("tool") not in tool:
@@ -1297,10 +1497,18 @@ def findings_to_sarif(scan_id: str, report: dict[str, Any], findings: list[dict[
                 "severity": finding.get("severity"),
                 "confidence": finding.get("confidence"),
                 "triage_status": finding.get("triage_status"),
+                "fp_verdict": (finding.get("fp_check") or {}).get("verdict"),
+                "duplicate_of": (finding.get("fp_check") or {}).get("duplicate_of"),
             },
         }
         if location:
             result["locations"] = [location]
+        # Only human or agent decisions suppress a result; heuristic verdicts stay visible.
+        if finding.get("triage_status") in ("false_positive", "accepted_risk"):
+            suppression: dict[str, Any] = {"kind": "external", "status": "accepted"}
+            if finding.get("triage_note"):
+                suppression["justification"] = finding["triage_note"]
+            result["suppressions"] = [suppression]
         run["results"].append(result)
     for run in runs.values():
         run.pop("_rule_index", None)
@@ -1318,6 +1526,8 @@ def get_report(
     tool: str | None = None,
     category: str | None = None,
     path_contains: str | None = None,
+    triage_status: str | None = None,
+    fp_verdict: str | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -1326,13 +1536,18 @@ def get_report(
     severity_filter = parse_filter_values(severity, SEVERITIES, "severity")
     tool_filter = parse_filter_values(tool, tuple(SCANNER_BINARIES), "tool")
     category_filter = parse_filter_values(category, CATEGORIES, "category")
-    if any(value is not None for value in (severity_filter, tool_filter, category_filter, path_contains)):
+    triage_filter = parse_filter_values(triage_status, TRIAGE_STATUSES, "triage_status")
+    verdict_filter = parse_filter_values(fp_verdict, FP_VERDICTS, "fp_verdict")
+    filters = (severity_filter, tool_filter, category_filter, path_contains, triage_filter, verdict_filter)
+    if any(value is not None for value in filters):
         findings = filter_findings(
             findings,
             severity=severity_filter,
             tool=tool_filter,
             category=category_filter,
             path_contains=clean_text(path_contains, 1000) if path_contains else None,
+            triage_status=triage_filter,
+            fp_verdict=verdict_filter,
         )
     matched = len(findings)
     offset = max(0, offset)
@@ -1345,9 +1560,72 @@ def get_report(
         "returned": len(findings),
         "offset": offset,
         "limit": limit,
-        "applied": {"severity": severity, "tool": tool, "category": category, "path_contains": path_contains},
+        "applied": {
+            "severity": severity,
+            "tool": tool,
+            "category": category,
+            "path_contains": path_contains,
+            "triage_status": triage_status,
+            "fp_verdict": fp_verdict,
+        },
     }
     return report
+
+
+class TriageUpdate(BaseModel):
+    status: str = Field(description="One of: " + ", ".join(TRIAGE_STATUSES))
+    note: str = Field("", max_length=2000, description="Why the finding has this status")
+
+
+REPORT_WRITE_LOCK = threading.Lock()
+
+
+@api.patch("/scans/{scan_id}/findings/{finding_id}")
+def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[str, Any]:
+    status = update.status.strip().lower()
+    if status not in TRIAGE_STATUSES:
+        raise HTTPException(status_code=422, detail={"message": "Unknown triage status", "allowed": list(TRIAGE_STATUSES)})
+    if not re.fullmatch(r"[0-9a-f]{24}", finding_id):
+        raise HTTPException(status_code=404, detail="Finding not found")
+    note = clean_text(update.note, 2000)
+    with REPORT_WRITE_LOCK:
+        row, report = load_report(scan_id)
+        findings = report.get("findings") or []
+        target = next((finding for finding in findings if finding.get("id") == finding_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Finding not found")
+        # A decision covers every scanner's copy of the same dependency vulnerability.
+        root = (target.get("fp_check") or {}).get("duplicate_of") or target["id"]
+        group = [
+            finding for finding in findings
+            if finding.get("id") == root or (finding.get("fp_check") or {}).get("duplicate_of") == root
+        ]
+        now = utc_now()
+        with connect_db() as db:
+            for finding in group:
+                key = finding.get("match_key") or finding_match_key(finding)
+                finding["match_key"] = key
+                if status == "needs_review":
+                    db.execute("DELETE FROM triage_decisions WHERE project = ? AND match_key = ?", (row["name"], key))
+                else:
+                    db.execute(
+                        "INSERT INTO triage_decisions (project, match_key, status, note, updated_at, scan_id, finding_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (project, match_key) DO UPDATE SET "
+                        "status = excluded.status, note = excluded.note, updated_at = excluded.updated_at, "
+                        "scan_id = excluded.scan_id, finding_id = excluded.finding_id",
+                        (row["name"], key, status, note, now, scan_id, finding["id"]),
+                    )
+                finding["triage_status"] = status
+                finding["triage_note"] = note or None
+                finding["triage_updated_at"] = now
+                finding["triage_source"] = "manual"
+        report.setdefault("summary", {}).update(triage_summary(findings))
+        directory = job_dir(scan_id)
+        temporary_report = directory / "report.json.tmp"
+        temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
+        temporary_report.replace(directory / "report.json")
+        update_scan(scan_id, summary_json=json.dumps(report["summary"]))
+    return {"finding": target, "updated": [finding["id"] for finding in group], "summary": report["summary"]}
 
 
 @api.get("/scans/{scan_id}/report.sarif")
