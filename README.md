@@ -81,6 +81,28 @@ curl -sS 'http://127.0.0.1:8000/api/scans/SCAN_ID/report?severity=critical,high&
 curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report.sarif -o results.sarif
 ```
 
+### Reviewer reports
+
+The dashboard has a **Reports** section for each finished scan. Open a finding and choose **Thêm finding vào report**, or create a manual entry. Each draft follows the REPORT-01 layout: title, CWE, severity, CVSS vector, Summary, Technical Details, Impact, Remediation, and Validation needed. Only the finding's title, CWE, severity, and evidence-backed CVSS vector are copied into a draft. Reviewers write the narrative fields; blank fields appear as `_To be completed by reviewer._` in the Markdown export. A supplied CVSS vector determines both the displayed score and severity.
+
+The same workflow is available through the authenticated API:
+
+```sh
+# Create an entry from a finding (omit finding_id for a manual entry).
+curl -sS -X POST "http://127.0.0.1:8000/api/scans/SCAN_ID/reports" \
+  -H 'Content-Type: application/json' -d '{"finding_id":"FINDING_ID"}'
+
+# Edit the entry's report text.
+curl -sS -X PATCH "http://127.0.0.1:8000/api/scans/SCAN_ID/reports/ENTRY_ID" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Unauthenticated Disclosure of Applicant and Contact Information","cwe":"CWE-862 – Missing Authorization","cvss_vector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N","summary":"...","technical_details":"...","impact":"...","remediation":"...","validation_needed":"..."}'
+
+curl -sS "http://127.0.0.1:8000/api/scans/SCAN_ID/reports"
+curl -sS "http://127.0.0.1:8000/api/scans/SCAN_ID/reports.md" -o report.md
+```
+
+`DELETE /api/scans/{scan_id}/reports/{entry_id}` removes an entry. Entries are kept with their scan and removed when that scan is deleted or expires under `RETENTION_DAYS`.
+
 ## Tests
 
 The report-endpoint tests run with the service's virtualenv and do not require pytest:

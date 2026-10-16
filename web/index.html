@@ -112,6 +112,34 @@
             </article>
           </section>
 
+          <section class="reports-section" aria-labelledby="reports-heading">
+            <div class="section-head">
+              <div><p class="eyebrow">REVIEWER REPORT</p><h2 id="reports-heading">Reports <span id="report-entry-count" class="count-badge">0</span></h2></div>
+              <div class="report-controls">
+                <button id="add-report-entry" class="secondary-button" type="button">＋ Mục thủ công</button>
+                <button id="export-markdown" class="primary-button" type="button">↓ Export Markdown</button>
+              </div>
+            </div>
+            <p class="reports-help">Mở một finding để thêm vào báo cáo, sau đó biên tập các mục theo mẫu REPORT-01.</p>
+            <div id="report-entry-list" class="report-entry-list"></div>
+            <form id="report-editor" class="report-editor hidden">
+              <div class="report-editor-head"><h3 id="report-editor-title">Report entry</h3><button id="close-report-editor" class="icon-button" type="button" aria-label="Đóng trình biên tập">×</button></div>
+              <div class="report-field-grid">
+                <label class="wide">Title <input name="title" type="text" maxlength="240" required></label>
+                <label>CWE <input name="cwe" type="text" maxlength="240" placeholder="CWE-862 – Missing Authorization"></label>
+                <label>Severity <select name="severity"><option value="unknown">Unknown</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="info">Info</option><option value="none">None</option></select></label>
+                <label class="wide">CVSS vector <input name="cvss_vector" type="text" maxlength="120" placeholder="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"></label>
+                <label class="wide">Summary <textarea name="summary" rows="3" maxlength="6000"></textarea></label>
+                <label class="wide">Technical Details <textarea name="technical_details" rows="5" maxlength="12000"></textarea></label>
+                <label class="wide">Impact <textarea name="impact" rows="3" maxlength="6000"></textarea></label>
+                <label class="wide">Remediation <textarea name="remediation" rows="3" maxlength="6000"></textarea></label>
+                <label class="wide">Validation needed <textarea name="validation_needed" rows="3" maxlength="6000"></textarea></label>
+              </div>
+              <p class="reports-help">CVSS score và mức severity được tính từ vector khi lưu.</p>
+              <div class="report-editor-actions"><button class="primary-button" type="submit">Lưu mục báo cáo</button></div>
+            </form>
+          </section>
+
           <section class="findings-section">
             <div class="section-head"><div><p class="eyebrow">DETAILED RESULTS</p><h2>Findings <span id="visible-count" class="count-badge">0</span></h2></div><p>Scanner results require manual validation.</p></div>
             <div class="filter-bar">

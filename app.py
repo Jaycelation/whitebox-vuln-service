@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import whitebox_dataflow
 import whitebox_evidence
+import whitebox_reports
 import whitebox_verify
 
 
@@ -199,6 +200,21 @@ def initialize_storage() -> None:
             if column not in decision_columns:
                 with suppress(sqlite3.OperationalError):
                     db.execute(f"ALTER TABLE triage_decisions ADD COLUMN {column} {definition}")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS report_items (
+                id TEXT PRIMARY KEY,
+                scan_id TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                finding_id TEXT,
+                content_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (scan_id, number),
+                UNIQUE (scan_id, finding_id)
+            )"""
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS report_items_scan_number ON report_items (scan_id, number)")
+        db.execute("CREATE TABLE IF NOT EXISTS report_sequences (scan_id TEXT PRIMARY KEY, next_number INTEGER NOT NULL)")
 
 
 def job_dir(scan_id: str) -> Path:
@@ -1217,6 +1233,8 @@ def prune_expired() -> int:
     for row in rows:
         shutil.rmtree(job_dir(row["id"]), ignore_errors=True)
         with connect_db() as db:
+            db.execute("DELETE FROM report_items WHERE scan_id = ?", (row["id"],))
+            db.execute("DELETE FROM report_sequences WHERE scan_id = ?", (row["id"],))
             db.execute("DELETE FROM scans WHERE id = ?", (row["id"],))
     return len(rows)
 
@@ -1718,6 +1736,108 @@ def get_report(
     return report
 
 
+class ReportItemCreate(BaseModel):
+    finding_id: str | None = Field(None, description="Optional finding to use as a report draft")
+
+
+def public_report_item(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **json.loads(row["content_json"]),
+        "id": row["id"], "number": row["number"], "finding_id": row["finding_id"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+
+def list_report_items(scan_id: str) -> list[dict[str, Any]]:
+    with connect_db() as db:
+        rows = db.execute("SELECT * FROM report_items WHERE scan_id = ? ORDER BY number", (scan_id,)).fetchall()
+    return [public_report_item(row) for row in rows]
+
+
+@api.get("/scans/{scan_id}/reports", tags=["reports"])
+def get_curated_reports(scan_id: str) -> dict[str, Any]:
+    row, _ = load_report(scan_id)
+    return {"scan_id": scan_id, "project": row["name"], "items": list_report_items(scan_id)}
+
+
+@api.post("/scans/{scan_id}/reports", status_code=201, tags=["reports"])
+def create_report_item(scan_id: str, request: ReportItemCreate) -> dict[str, Any]:
+    _, report = load_report(scan_id)
+    finding = None
+    if request.finding_id is not None:
+        if not re.fullmatch(r"[0-9a-f]{24}", request.finding_id):
+            raise HTTPException(status_code=422, detail="finding_id must be a 24-character hexadecimal ID")
+        finding = next((entry for entry in report.get("findings") or [] if entry.get("id") == request.finding_id), None)
+        if finding is None:
+            raise HTTPException(status_code=404, detail="Finding not found in this scan")
+    content = whitebox_reports.apply_update(whitebox_reports.draft_from_finding(finding), whitebox_reports.ReportItemUpdate())
+    now = utc_now()
+    item_id = uuid.uuid4().hex
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        count = db.execute("SELECT COUNT(*) FROM report_items WHERE scan_id = ?", (scan_id,)).fetchone()[0]
+        if count >= 200:
+            raise HTTPException(status_code=409, detail="A scan can have at most 200 report entries")
+        sequence = db.execute("SELECT next_number FROM report_sequences WHERE scan_id = ?", (scan_id,)).fetchone()
+        if sequence is None:
+            number = db.execute("SELECT COALESCE(MAX(number), 0) + 1 FROM report_items WHERE scan_id = ?", (scan_id,)).fetchone()[0]
+            db.execute("INSERT INTO report_sequences (scan_id, next_number) VALUES (?, ?)", (scan_id, number + 1))
+        else:
+            number = sequence["next_number"]
+            db.execute("UPDATE report_sequences SET next_number = ? WHERE scan_id = ?", (number + 1, scan_id))
+        try:
+            db.execute(
+                "INSERT INTO report_items (id, scan_id, number, finding_id, content_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (item_id, scan_id, number, request.finding_id, json.dumps(content, ensure_ascii=False), now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="This finding is already in the report") from exc
+    return {**content, "id": item_id, "number": number, "finding_id": request.finding_id, "created_at": now, "updated_at": now}
+
+
+@api.patch("/scans/{scan_id}/reports/{item_id}", tags=["reports"])
+def update_report_item(scan_id: str, item_id: str, update: whitebox_reports.ReportItemUpdate) -> dict[str, Any]:
+    load_report(scan_id)
+    if not re.fullmatch(r"[0-9a-f]{32}", item_id):
+        raise HTTPException(status_code=404, detail="Report entry not found")
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM report_items WHERE scan_id = ? AND id = ?", (scan_id, item_id)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Report entry not found")
+        try:
+            content = whitebox_reports.apply_update(json.loads(row["content_json"]), update)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        now = utc_now()
+        db.execute(
+            "UPDATE report_items SET content_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(content, ensure_ascii=False), now, item_id),
+        )
+    return {**content, "id": item_id, "number": row["number"], "finding_id": row["finding_id"], "created_at": row["created_at"], "updated_at": now}
+
+
+@api.delete("/scans/{scan_id}/reports/{item_id}", status_code=204, tags=["reports"])
+def delete_report_item(scan_id: str, item_id: str) -> None:
+    load_report(scan_id)
+    if not re.fullmatch(r"[0-9a-f]{32}", item_id):
+        raise HTTPException(status_code=404, detail="Report entry not found")
+    with connect_db() as db:
+        result = db.execute("DELETE FROM report_items WHERE scan_id = ? AND id = ?", (scan_id, item_id))
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Report entry not found")
+
+
+@api.get("/scans/{scan_id}/reports.md", tags=["reports"])
+def export_curated_reports(scan_id: str) -> PlainTextResponse:
+    row, _ = load_report(scan_id)
+    markdown = whitebox_reports.render_markdown(row["name"], scan_id, list_report_items(scan_id))
+    return PlainTextResponse(
+        markdown, media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="whitebox-reports-{scan_id}.md"'},
+    )
+
+
 class TriageUpdate(BaseModel):
     status: str = Field(description="One of: " + ", ".join(TRIAGE_STATUSES))
     note: str = Field("", max_length=2000, description="Why the finding has this status")
@@ -1853,6 +1973,8 @@ def delete_scan(scan_id: str) -> None:
         raise HTTPException(status_code=409, detail="Queued or running scans cannot be deleted")
     shutil.rmtree(job_dir(scan_id), ignore_errors=True)
     with connect_db() as db:
+        db.execute("DELETE FROM report_items WHERE scan_id = ?", (scan_id,))
+        db.execute("DELETE FROM report_sequences WHERE scan_id = ?", (scan_id,))
         db.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
 
 

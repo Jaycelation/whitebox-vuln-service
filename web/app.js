@@ -10,7 +10,7 @@ const evidenceLabels = {
 };
 function evidenceLevel(finding) { return finding.evidence?.level || "present"; }
 const agentLabels = { confirmed: "xác nhận", false_positive: "false positive", uncertain: "chưa đủ dữ liệu" };
-const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false, unlocked: false };
+const state = { key: "", scans: [], selected: null, report: null, curated: null, editing: null, shown: 40, loading: false, unlocked: false };
 
 function node(tag, className, content) {
   const element = document.createElement(tag);
@@ -69,11 +69,14 @@ function lockScreen(message = "") {
   state.scans = [];
   state.selected = null;
   state.report = null;
+  state.curated = null;
+  state.editing = null;
   $("api-key").value = "";
   $("app-shell").classList.add("hidden");
   $("auth-screen").classList.remove("hidden");
   loginError(message);
   closeDetail();
+  closeReportEditor();
   $("api-key").focus();
 }
 function applyTheme(theme) {
@@ -89,6 +92,7 @@ async function loadScans({ quiet = false } = {}) {
   if (state.loading) return false;
   state.loading = true;
   try {
+    const previousSelected = state.selected;
     const data = await api("/api/scans?limit=200");
     state.scans = Array.isArray(data.scans) ? data.scans : [];
     setConnectionStatus("Connected");
@@ -96,6 +100,8 @@ async function loadScans({ quiet = false } = {}) {
     const preferred = selectedFromHash() || state.selected;
     state.selected = state.scans.some((scan) => scan.id === preferred) ? preferred : state.scans[0]?.id || null;
     renderScanList();
+    const current = state.scans.find((scan) => scan.id === state.selected);
+    if (quiet && state.selected === previousSelected && state.report && !["queued", "running"].includes(current?.status)) return true;
     await loadSelectedReport();
     return Boolean(state.key);
   } catch (error) {
@@ -141,6 +147,8 @@ async function loadSelectedReport() {
   const scan = state.scans.find((item) => item.id === id);
   if (!scan) {
     state.report = null;
+    state.curated = null;
+    closeReportEditor();
     $("dashboard").classList.add("hidden");
     $("empty-state").classList.remove("hidden");
     $("empty-state").querySelector("p:last-child").textContent = "Chưa có lượt scan. Dùng New scan để tải mã nguồn ZIP lên.";
@@ -154,6 +162,8 @@ async function loadSelectedReport() {
   text("scan-status", scan.status || "unknown");
   $("scan-status").className = `status-pill ${["partial", "failed", "queued", "running"].includes(scan.status) ? scan.status : ""}`;
   state.report = null;
+  state.curated = null;
+  closeReportEditor();
   if (["queued", "running"].includes(scan.status)) {
     setRunBanner("Scan đang chạy. Trang sẽ tự cập nhật khi có báo cáo.");
     renderReport();
@@ -163,6 +173,15 @@ async function loadSelectedReport() {
     const report = await api(`/api/scans/${id}/report`);
     if (state.selected !== id) return;
     state.report = report;
+    try {
+      const curated = await api(`/api/scans/${id}/reports`);
+      if (state.selected !== id) return;
+      state.curated = curated.items;
+    } catch (error) {
+      if (error.status === 401) { lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại."); return; }
+      state.curated = null;
+      notice(`Không tải được reports: ${error.message}`, true);
+    }
     const failed = (report.scanners || []).filter((scanner) => scanner.status !== "completed");
     const notes = [];
     if (failed.length) notes.push(`Báo cáo chưa đầy đủ: ${failed.map((item) => item.name).join(", ")} không hoàn tất. Xem trạng thái scanner trong JSON.`);
@@ -203,7 +222,98 @@ function renderReport() {
   renderSeverityChart(counts, findings.length);
   renderToolChart(tools, findings.length);
   renderToolFilter(tools);
+  renderCuratedReports();
   renderFindings();
+}
+
+const reportFields = ["title", "cwe", "severity", "cvss_vector", "summary", "technical_details", "impact", "remediation", "validation_needed"];
+
+function reportError(error) {
+  if (error.status === 401) lockScreen("API key không còn hợp lệ. Vui lòng đăng nhập lại.");
+  else notice(`Không cập nhật được report: ${error.message}`, true);
+}
+
+function closeReportEditor() {
+  state.editing = null;
+  $("report-editor").classList.add("hidden");
+  $("export-markdown").disabled = !Array.isArray(state.curated) || !state.curated.length;
+}
+
+function openReportEditor(item) {
+  if (!item) return;
+  state.editing = item.id;
+  const form = $("report-editor");
+  for (const field of reportFields) form.elements.namedItem(field).value = item[field] ?? "";
+  text("report-editor-title", `REPORT-${String(item.number).padStart(2, "0")} · ${item.finding_id ? "Từ finding" : "Mục thủ công"}`);
+  form.classList.remove("hidden");
+  $("export-markdown").disabled = true;
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
+  form.elements.namedItem("title").focus();
+}
+
+function renderCuratedReports() {
+  const items = state.curated;
+  const list = $("report-entry-list"); clear(list);
+  text("report-entry-count", Array.isArray(items) ? items.length : 0);
+  $("add-report-entry").disabled = !state.report || !Array.isArray(items);
+  $("export-markdown").disabled = !Array.isArray(items) || !items.length || Boolean(state.editing);
+  if (!state.report) {
+    list.append(node("p", "reports-empty", "Reports sẽ sẵn sàng sau khi scan hoàn tất."));
+    return;
+  }
+  if (!Array.isArray(items)) {
+    list.append(node("p", "reports-empty", "Không tải được reports. Hãy làm mới trang."));
+    return;
+  }
+  if (!items.length) {
+    list.append(node("p", "reports-empty", "Chưa có mục báo cáo. Mở finding để thêm, hoặc tạo mục thủ công."));
+    return;
+  }
+  for (const item of items) {
+    const card = node("article", "report-entry-card");
+    const body = node("div", "report-entry-body");
+    body.append(node("span", "report-number", `REPORT-${String(item.number).padStart(2, "0")}`), node("h3", "", item.title));
+    const severity = item.cvss_score === null ? item.severity : `${item.severity} (${Number(item.cvss_score).toFixed(1)})`;
+    body.append(node("p", "report-entry-meta", `${item.cwe || "CWE chưa gán"} · ${severity || "unknown"}${item.finding_id ? " · từ finding" : ""}`));
+    if (item.summary) body.append(node("p", "report-entry-summary", item.summary));
+    const actions = node("div", "report-entry-actions");
+    const edit = node("button", "secondary-button", "Biên tập"); edit.type = "button";
+    edit.addEventListener("click", () => openReportEditor(item));
+    const remove = node("button", "report-delete", "Xóa"); remove.type = "button";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Xóa REPORT-${String(item.number).padStart(2, "0")}?`)) return;
+      const scanId = state.selected;
+      try {
+        await api(`/api/scans/${scanId}/reports/${item.id}`, { method: "DELETE" });
+        if (state.selected !== scanId) return;
+        state.curated = state.curated.filter((entry) => entry.id !== item.id);
+        if (state.editing === item.id) closeReportEditor();
+        renderCuratedReports();
+        notice("Đã xóa mục báo cáo.");
+      } catch (error) { reportError(error); }
+    });
+    actions.append(edit, remove);
+    card.append(body, actions);
+    list.append(card);
+  }
+}
+
+async function addReportEntry(findingId = null) {
+  const scanId = state.selected;
+  if (!scanId || !Array.isArray(state.curated)) return;
+  const existing = state.curated.find((item) => findingId && item.finding_id === findingId);
+  if (existing) { closeDetail(); openReportEditor(existing); return; }
+  try {
+    const item = await api(`/api/scans/${scanId}/reports`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ finding_id: findingId }),
+    });
+    if (state.selected !== scanId) return;
+    state.curated.push(item);
+    renderCuratedReports();
+    closeDetail();
+    openReportEditor(item);
+    notice("Đã tạo bản nháp report. Hoàn thiện nội dung trước khi xuất.");
+  } catch (error) { reportError(error); }
 }
 
 function renderSeverityChart(counts, total) {
@@ -314,6 +424,13 @@ function showDetail(finding) {
   const meta = node("div", "detail-meta");
   meta.append(node("span", `severity-badge ${severityOrder.includes(finding.severity) ? finding.severity : "unknown"}`, finding.severity || "unknown"), node("span", "severity-badge", finding.tool || "unknown"), node("span", "severity-badge", finding.category || "unknown"));
   content.append(meta);
+  if (Array.isArray(state.curated)) {
+    const existing = state.curated.find((item) => item.finding_id === finding.id);
+    const add = node("button", "primary-button detail-report-button", existing ? "Biên tập report cho finding này" : "＋ Thêm finding vào report");
+    add.type = "button";
+    add.addEventListener("click", () => addReportEntry(finding.id));
+    content.append(add);
+  }
   const info = node("section", "detail-section");
   info.append(node("h3", "", "LOCATION & RULE"));
   const dl = node("dl", "detail-kv");
@@ -453,6 +570,46 @@ $("download-report").addEventListener("click", () => {
   const link = node("a"); link.href = url; link.download = `whitebox-report-${state.selected}.json`;
   document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+$("add-report-entry").addEventListener("click", () => addReportEntry());
+$("close-report-editor").addEventListener("click", closeReportEditor);
+$("report-editor").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const scanId = state.selected;
+  const itemId = state.editing;
+  if (!scanId || !itemId) return;
+  const payload = Object.fromEntries(reportFields.map((field) => [field, form.elements.namedItem(field).value]));
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    const updated = await api(`/api/scans/${scanId}/reports/${itemId}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (state.selected !== scanId) return;
+    state.curated = state.curated.map((item) => item.id === itemId ? updated : item);
+    closeReportEditor();
+    renderCuratedReports();
+    notice("Đã lưu mục báo cáo.");
+  } catch (error) { reportError(error); }
+  finally { button.disabled = false; }
+});
+$("export-markdown").addEventListener("click", async () => {
+  const scanId = state.selected;
+  if (!scanId || !state.curated?.length) return;
+  try {
+    const response = await fetch(`/api/scans/${scanId}/reports.md`, {
+      headers: { Authorization: `Bearer ${state.key}` }, cache: "no-store",
+    });
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}`); error.status = response.status; throw error;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = node("a"); link.href = url; link.download = `whitebox-reports-${scanId}.md`;
+    document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { reportError(error); }
 });
 $("close-detail").addEventListener("click", closeDetail);
 $("detail-backdrop").addEventListener("click", closeDetail);

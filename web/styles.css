@@ -1282,3 +1282,44 @@ html[data-theme="light"] .code-window { background: #f4f7fb; border: 1px solid #
 html[data-theme="light"] .code-line { color: #223249; }
 html[data-theme="light"] .code-line.traced { background: #fff1d6; color: #5c3a00; }
 html[data-theme="light"] .code-number { color: #8a9bb0; }
+
+/* Reviewer-authored report entries. */
+.reports-section { margin: 0 0 39px; }
+.reports-section .section-head { align-items: center; margin-bottom: 8px; }
+.report-controls, .report-entry-actions, .report-editor-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.reports-help { margin: 7px 0 16px; color: #90a2b7; font-size: 12px; line-height: 1.5; }
+.report-entry-list { display: grid; gap: 10px; }
+.reports-empty { margin: 0; padding: 22px; border: 1px dashed #34485e; border-radius: 9px; color: #90a2b7; font-size: 12px; }
+.report-entry-card { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 17px 20px; background: #152136; border: 1px solid #293850; border-radius: 9px; }
+.report-entry-body { min-width: 0; }
+.report-number { color: #62d7ca; font-size: 10px; font-weight: 800; letter-spacing: .12em; }
+.report-entry-card h3 { margin: 6px 0; color: #e8edf7; font-size: 15px; overflow-wrap: anywhere; }
+.report-entry-meta { margin: 0; color: #93a5bb; font-size: 11px; text-transform: capitalize; }
+.report-entry-summary { margin: 10px 0 0; color: #b8c8d9; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.report-delete { padding: 9px 12px; color: #f0a8b2; background: transparent; border: 1px solid #70444b; border-radius: 7px; font-size: 11px; font-weight: 700; }
+.report-delete:hover { background: #482d35; }
+.report-editor { margin-top: 14px; padding: 22px; background: #152136; border: 1px solid #3b746f; border-radius: 9px; scroll-margin-top: 20px; }
+.report-editor-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+.report-editor-head h3 { margin: 0; font-size: 16px; }
+.report-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.report-field-grid label { display: grid; gap: 6px; color: #a9bbcf; font-size: 12px; font-weight: 650; }
+.report-field-grid label.wide { grid-column: 1 / -1; }
+.report-field-grid input, .report-field-grid select, .report-field-grid textarea { width: 100%; min-width: 0; padding: 10px 11px; background: #0e1b2d; color: #e4edf7; border: 1px solid #35465b; border-radius: 6px; font: inherit; font-size: 12px; }
+.report-field-grid textarea { resize: vertical; min-height: 72px; line-height: 1.5; }
+.report-field-grid input:focus-visible, .report-field-grid select:focus-visible, .report-field-grid textarea:focus-visible { outline: 2px solid #51d9ca; outline-offset: 1px; }
+.report-editor-actions { justify-content: flex-end; margin-top: 18px; }
+.detail-report-button { margin: 0 0 18px; }
+html[data-theme="light"] .reports-empty, html[data-theme="light"] .report-entry-card, html[data-theme="light"] .report-editor { background: #fff; border-color: #ccd9e5; }
+html[data-theme="light"] .report-entry-card h3, html[data-theme="light"] .report-editor-head h3 { color: #263a53; }
+html[data-theme="light"] .reports-help, html[data-theme="light"] .report-entry-meta, html[data-theme="light"] .report-entry-summary, html[data-theme="light"] .reports-empty { color: #5a6f87; }
+html[data-theme="light"] .report-field-grid label { color: #526c83; }
+html[data-theme="light"] .report-field-grid input, html[data-theme="light"] .report-field-grid select, html[data-theme="light"] .report-field-grid textarea { background: #f8fafc; color: #263a53; border-color: #cbd8e4; }
+html[data-theme="light"] .report-delete { color: #a93e4e; border-color: #e7abb4; }
+html[data-theme="light"] .report-delete:hover { background: #fff0f1; }
+@media (max-width: 740px) {
+  .reports-section .section-head, .report-entry-card { align-items: flex-start; flex-direction: column; }
+  .report-controls { margin-top: 12px; }
+  .report-field-grid { grid-template-columns: 1fr; }
+  .report-field-grid label { grid-column: 1 / -1; }
+  .report-editor { padding: 16px; }
+}
