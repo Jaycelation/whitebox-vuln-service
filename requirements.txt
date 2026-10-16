@@ -2,3 +2,4 @@ fastapi>=0.115,<1
 python-multipart>=0.0.18,<1
 uvicorn[standard]>=0.34,<1
 anthropic>=1.12,<2
+mcp>=1.2,<2
