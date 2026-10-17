@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import whitebox_classify
 import whitebox_dataflow
 import whitebox_evidence
 import whitebox_reports
@@ -386,7 +387,9 @@ def normalized_path(value: Any, source_root: Path) -> str | None:
 
 def normalize_severity(value: Any) -> str:
     severity = str(value or "unknown").strip().lower()
-    aliases = {"error": "high", "warning": "medium", "informational": "info", "none": "unknown"}
+    # GHSA uses MODERATE, Red Hat IMPORTANT and NEGLIGIBLE, Semgrep ERROR/WARNING.
+    aliases = {"error": "high", "warning": "medium", "informational": "info", "information": "info", "none": "unknown",
+               "moderate": "medium", "important": "high", "negligible": "low", "minor": "low", "major": "high"}
     severity = aliases.get(severity, severity)
     return severity if severity in SEVERITIES else "unknown"
 
@@ -407,6 +410,9 @@ def make_finding(
     package: Any = None,
     package_version: Any = None,
     aliases: Any = None,
+    cwe: Any = None,
+    owasp: Any = None,
+    vuln_class: str | None = None,
     source_root: Path,
 ) -> dict[str, Any]:
     try:
@@ -445,6 +451,7 @@ def make_finding(
         finding["package"] = clean_text(package, 200)
         finding["package_version"] = clean_text(package_version, 100) or None
         finding["aliases"] = sorted({clean_text(alias, 100) for alias in aliases or [] if isinstance(alias, str) and alias})[:20]
+    whitebox_classify.classify(finding, cwe=cwe, owasp=owasp, vuln_class=vuln_class)
     return finding
 
 
@@ -467,6 +474,8 @@ def parse_semgrep(data: Any, source_root: Path) -> list[dict[str, Any]]:
                 rule_id=item.get("check_id"),
                 confidence=metadata.get("confidence"),
                 references=metadata.get("references"),
+                cwe=metadata.get("cwe"),
+                owasp=metadata.get("owasp"),
                 source_root=source_root,
             )
         )
@@ -521,6 +530,7 @@ def parse_trivy(data: Any, source_root: Path) -> list[dict[str, Any]]:
                     package=item.get("PkgName"),
                     package_version=item.get("InstalledVersion"),
                     aliases=item.get("VendorIDs"),
+                    cwe=item.get("CweIDs"),
                     source_root=source_root,
                 )
             finding["ecosystem"] = clean_text(result.get("Type"), 40) or None
@@ -601,7 +611,8 @@ def osv_severity(vulnerability: dict[str, Any]) -> str:
     for score in vulnerability.get("severity") or []:
         raw = score.get("score") if isinstance(score, dict) else None
         try:
-            numeric = float(raw)
+            # OSV records usually hold a CVSS vector rather than a number.
+            numeric = whitebox_evidence.cvss31_base_score(raw) if whitebox_evidence.valid_vector(raw) else float(raw)
         except (TypeError, ValueError):
             continue
         if numeric >= 9:
@@ -654,6 +665,7 @@ def parse_osv(data: Any, source_root: Path) -> list[dict[str, Any]]:
                         package=package.get("name"),
                         package_version=package.get("version"),
                         aliases=aliases,
+                        cwe=(vulnerability.get("database_specific") or {}).get("cwe_ids"),
                         source_root=source_root,
                     )
                 finding["ecosystem"] = clean_text(package.get("ecosystem"), 40) or None
@@ -726,9 +738,10 @@ def parse_dataflow(data: Any, source_root: Path) -> list[dict[str, Any]]:
             # Flows through summarized helpers match functions by name, so they are less certain.
             confidence="medium" if item.get("interprocedural") else "high",
             references=[f"https://cwe.mitre.org/data/definitions/{details['cwe'].split('-')[1]}.html"],
+            cwe=details["cwe"],
+            vuln_class=item["class"],
             source_root=source_root,
         )
-        finding["cwe"] = details["cwe"]
         finding["trace"] = trace
         findings.append(finding)
     return findings
@@ -923,14 +936,26 @@ async def run_scanners(names: list[str], source_root: Path, work_dir: Path) -> l
 
 def summarize(findings: list[dict[str, Any]], scanners: list[dict[str, Any]]) -> dict[str, Any]:
     severities = {severity: 0 for severity in SEVERITIES}
+    # Duplicates repeat another finding (two scanners, one issue); counting them
+    # once gives the number of distinct issues.
+    unique_severities = {severity: 0 for severity in SEVERITIES}
     by_tool: dict[str, int] = {}
+    by_category = {category: 0 for category in CATEGORIES}
     for finding in findings:
         severities[finding["severity"]] += 1
         by_tool[finding["tool"]] = by_tool.get(finding["tool"], 0) + 1
+        if (finding.get("fp_check") or {}).get("verdict") != "duplicate":
+            unique_severities[finding["severity"]] += 1
+            if finding.get("category"):
+                by_category[finding["category"]] = by_category.get(finding["category"], 0) + 1
     return {
         "total_findings": len(findings),
+        "unique_findings": sum(unique_severities.values()),
         "severity": severities,
+        "severity_unique": unique_severities,
         "by_tool": by_tool,
+        "by_category": by_category,
+        "classification": whitebox_classify.summary(findings),
         "scanners_completed": sum(1 for scanner in scanners if scanner["status"] == "completed"),
         "scanners_failed": sum(1 for scanner in scanners if scanner["status"] != "completed"),
         "findings_truncated": False,
@@ -1007,6 +1032,12 @@ def check_false_positives(findings: list[dict[str, Any]], source_root: Path) -> 
     """Add fp_check and match_key to each finding while the source is still extracted."""
     lines = SourceLines(source_root)
     canonical: dict[tuple[str, str, str], str] = {}
+    # A traced dataflow finding is the stronger report of a sink that a Semgrep
+    # pattern also flags, so it is the canonical one whatever the scanner order.
+    traced_sinks: dict[str, list[dict[str, Any]]] = {}
+    for finding in findings:
+        if finding.get("tool") == "dataflow" and finding.get("path") and finding.get("line"):
+            traced_sinks.setdefault(finding["path"], []).append(finding)
     for finding in findings:
         reasons: list[str] = []
         likely_false = False
@@ -1060,6 +1091,15 @@ def check_false_positives(findings: list[dict[str, Any]], source_root: Path) -> 
                 reasons.append(f"Same secret location as finding {duplicate_of}.")
             else:
                 duplicate_of = None
+        elif category == "sast" and finding.get("tool") != "dataflow" and finding.get("line"):
+            start = finding["line"]
+            end = max(start, finding.get("end_line") or start)
+            traced = next((other for other in traced_sinks.get(path, [])
+                           if start <= other["line"] <= end and whitebox_classify.same_weakness(finding, other)), None)
+            if traced is not None:
+                duplicate_of = traced["id"]
+                verdict = "duplicate"
+                reasons.append(f"Same sink and weakness as traced finding {duplicate_of}.")
         finding["fp_check"] = {"verdict": verdict, "reasons": reasons, "duplicate_of": duplicate_of}
         finding["match_key"] = finding_match_key(finding, line_text)
 
@@ -1551,6 +1591,23 @@ def parse_filter_values(raw: str | None, allowed: tuple[str, ...], label: str) -
     return values
 
 
+def parse_classification_values(raw: str | None, normalize: Any, label: str) -> set[str] | None:
+    """CWE (`CWE-89` or `89`) or OWASP (`A03:2021`) ids from a comma-separated parameter."""
+    if raw is None or not raw.strip():
+        return None
+    values: set[str] = set()
+    invalid = []
+    for part in (part.strip() for part in raw.split(",") if part.strip()):
+        normalized = normalize(part)
+        if normalized:
+            values.update(normalized)
+        else:
+            invalid.append(part)
+    if invalid:
+        raise HTTPException(status_code=422, detail={"message": f"Unknown {label}", "invalid": invalid})
+    return values
+
+
 def filter_findings(
     findings: list[dict[str, Any]],
     *,
@@ -1561,10 +1618,17 @@ def filter_findings(
     triage_status: set[str] | None = None,
     fp_verdict: set[str] | None = None,
     evidence: set[str] | None = None,
+    cwe: set[str] | None = None,
+    owasp: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     needle = path_contains.lower() if path_contains else None
     selected = []
     for finding in findings:
+        classification = finding.get("classification") or {}
+        if cwe is not None and not cwe & set(classification.get("cwe") or []):
+            continue
+        if owasp is not None and not owasp & set(classification.get("owasp") or []):
+            continue
         if triage_status is not None and finding.get("triage_status", "needs_review") not in triage_status:
             continue
         if fp_verdict is not None and (finding.get("fp_check") or {}).get("verdict", "needs_review") not in fp_verdict:
@@ -1689,6 +1753,8 @@ def get_report(
     triage_status: str | None = None,
     fp_verdict: str | None = None,
     evidence: str | None = None,
+    cwe: str | None = None,
+    owasp: str | None = None,
     limit: int | None = None,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -1700,7 +1766,10 @@ def get_report(
     triage_filter = parse_filter_values(triage_status, TRIAGE_STATUSES, "triage_status")
     verdict_filter = parse_filter_values(fp_verdict, FP_VERDICTS, "fp_verdict")
     evidence_filter = parse_filter_values(evidence, whitebox_evidence.EVIDENCE_LEVELS, "evidence")
-    filters = (severity_filter, tool_filter, category_filter, path_contains, triage_filter, verdict_filter, evidence_filter)
+    cwe_filter = parse_classification_values(cwe, whitebox_classify.normalize_cwes, "cwe")
+    owasp_filter = parse_classification_values(owasp, whitebox_classify.normalize_owasp, "owasp")
+    filters = (severity_filter, tool_filter, category_filter, path_contains, triage_filter, verdict_filter, evidence_filter,
+               cwe_filter, owasp_filter)
     if any(value is not None for value in filters):
         findings = filter_findings(
             findings,
@@ -1711,6 +1780,8 @@ def get_report(
             triage_status=triage_filter,
             fp_verdict=verdict_filter,
             evidence=evidence_filter,
+            cwe=cwe_filter,
+            owasp=owasp_filter,
         )
     matched = len(findings)
     offset = max(0, offset)
@@ -1731,6 +1802,8 @@ def get_report(
             "triage_status": triage_status,
             "fp_verdict": fp_verdict,
             "evidence": evidence,
+            "cwe": cwe,
+            "owasp": owasp,
         },
     }
     return report

@@ -316,6 +316,8 @@ def automatic_evidence(finding: dict[str, Any], root: Path, imports: ImportIndex
         level, items = "present", ["Configuration matches a hardening rule; impact depends on how it is deployed."]
     else:
         level, items = "present", ["A code pattern matched, without a traced path from request input."]
+        if str(finding.get("confidence") or "").lower() == "low":
+            items.append("The rule's author rates its confidence LOW; expect false positives.")
     if check.get("verdict") == "likely_false_positive":
         # A heuristic flag lowers the level one step but never hides the finding.
         level = "present" if level == "reachable" else "unverified"

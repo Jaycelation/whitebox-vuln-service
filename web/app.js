@@ -369,7 +369,9 @@ function filteredFindings() {
     if (evidence === "scored" && !item.cvss) return false;
     if (!["all", "scored"].includes(evidence) && evidenceLevel(item) !== evidence) return false;
     if (!query) return true;
-    return [item.title, item.message, item.path, item.rule_id].some((value) => String(value || "").toLocaleLowerCase().includes(query));
+    const classification = item.classification || {};
+    return [item.title, item.message, item.path, item.rule_id, classification.class, ...(classification.cwe || []), ...(classification.owasp || [])]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
   }).sort((a, b) => (b.cvss?.score ?? -1) - (a.cvss?.score ?? -1)
     || evidenceOrder.indexOf(evidenceLevel(a)) - evidenceOrder.indexOf(evidenceLevel(b))
     || (severityRank[a.severity] ?? 6) - (severityRank[b.severity] ?? 6)
@@ -428,7 +430,9 @@ function showDetail(finding, trigger = document.activeElement) {
   const info = node("section", "detail-section");
   info.append(node("h3", "", "LOCATION & RULE"));
   const dl = node("dl", "detail-kv");
-  for (const [label, value] of [["File", finding.path], ["Line", finding.line], ["Rule ID", finding.rule_id], ["Confidence", finding.confidence], ["Triage", finding.triage_status || "needs_review"]]) {
+  const classification = finding.classification || {};
+  const owasp = (classification.owasp || []).map((id, index) => classification.owasp_names?.[index] ? `${id} ${classification.owasp_names[index]}` : id).join(", ");
+  for (const [label, value] of [["File", finding.path], ["Line", finding.line], ["Rule ID", finding.rule_id], ["CWE", (classification.cwe || []).join(", ")], ["OWASP", owasp], ["Class", classification.class], ["Confidence", finding.confidence], ["Triage", finding.triage_status || "needs_review"]]) {
     dl.append(node("dt", "", label), node("dd", "", value || "—"));
   }
   info.append(dl); content.append(info);

@@ -269,6 +269,8 @@ async def whitebox_get_report(
     fp_verdict: str | None = None,
     triage_status: str | None = None,
     evidence: str | None = None,
+    cwe: str | None = None,
+    owasp: str | None = None,
 ) -> dict[str, Any]:
     """Get a scan summary and a page of findings; secret values are redacted by the service.
 
@@ -279,13 +281,18 @@ async def whitebox_get_report(
     Each finding also has evidence.level (confirmed, reachable, present, unverified,
     false_positive) with the reasons, and cvss only when the evidence shows the issue
     is real (confirmed or reachable). Pass evidence="confirmed,reachable" for those.
+
+    Each finding has classification with CWE ids, OWASP Top 10 2021 categories and a
+    vulnerability class, the same across scanners. Filter with cwe="CWE-89,CWE-78" or
+    owasp="A03:2021".
     """
     if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
         raise ValueError("Invalid scan ID")
     if offset < 0:
         raise ValueError("offset must be zero or greater")
     page_size = min(max(limit, 1), 50)
-    params = {key: value for key, value in (("fp_verdict", fp_verdict), ("triage_status", triage_status), ("evidence", evidence)) if value}
+    params = {key: value for key, value in (("fp_verdict", fp_verdict), ("triage_status", triage_status), ("evidence", evidence),
+                                            ("cwe", cwe), ("owasp", owasp)) if value}
     status, report = await asyncio.gather(
         _api_request("GET", f"/api/scans/{scan_id}"),
         _api_request("GET", f"/api/scans/{scan_id}/report", params=params),

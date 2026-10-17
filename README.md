@@ -63,10 +63,12 @@ curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report
 | `severity` | Comma-separated: `critical`, `high`, `medium`, `low`, `info`, `unknown` |
 | `tool` | Comma-separated: `semgrep`, `gitleaks`, `trivy`, `osv-scanner`, `joern` |
 | `category` | Comma-separated: `sast`, `secret`, `dependency`, `misconfiguration` |
+| `cwe` | Comma-separated CWE ids, such as `CWE-89,78`; matches any of the finding's CWEs |
+| `owasp` | Comma-separated OWASP Top 10 2021 ids, such as `A03:2021` |
 | `path_contains` | Case-insensitive substring match on a finding's `path` |
 | `limit`, `offset` | Paginate the matched findings |
 
-An unknown `severity`, `tool`, or `category` value returns `422` with the offending values listed.
+An unknown `severity`, `tool`, or `category` value, or a `cwe`/`owasp` value that is not an id, returns `422` with the offending values listed.
 
 ```sh
 # Only high and critical SAST findings, first 20
@@ -170,6 +172,20 @@ Other endpoints:
 
 Every finding has a stable id, scanner, category, severity, rule/advisory id, file path, line, references, an automatic `fp_check`, and a `triage_status` that starts as `needs_review`. Dependency findings also carry `package`, `package_version`, and `aliases`. Secret values are not included. Tool severity is kept as candidate evidence; it is not a probability that the issue is exploitable. Confirm source-to-sink reachability, input control, runtime configuration, and impact before reporting or fixing a result. The report also gives per-tool status, run time, exit code, and a severity summary.
 
+### Classification
+
+Scanners describe the same weakness in different terms, so every finding gets one `classification`:
+
+| Field | Source |
+| --- | --- |
+| `cwe` | CWE ids from Semgrep rule metadata, Trivy `CweIDs`, OSV `cwe_ids`, or the dataflow class. Secrets default to `CWE-798`. The first id is also stored as the finding's `cwe`, which report drafts copy. |
+| `owasp`, `owasp_names` | OWASP Top 10 2021 categories. Semgrep's own category is used when the rule has one (the 2021 edition is preferred over 2017). Otherwise it is derived from the CWE with the OWASP 2021 mapping, and `owasp_source` says `cwe-mapping`. Dependency findings always lead with `A06:2021`, misconfigurations default to `A05:2021`, and secrets to `A07:2021`. |
+| `class` | A vulnerability class such as `sql-injection`, `xss`, `ssrf`, or `hardcoded-secret`. Injection class names match the dataflow scanner's classes. |
+
+Severity words from different sources are put on one scale: GHSA `MODERATE` becomes `medium`, Red Hat `IMPORTANT` becomes `high` and `NEGLIGIBLE` becomes `low`, and Semgrep `ERROR`/`WARNING` become `high`/`medium`. OSV records that only carry a CVSS vector get the severity of that vector's base score.
+
+The summary counts each distinct issue once: `unique_findings`, `severity_unique`, and `by_category` skip findings marked `duplicate`, and `classification` gives counts by OWASP category, CWE (top 25), and class. `severity` and `total_findings` still count every reported finding.
+
 ### Source-to-sink analysis
 
 Dependency scanners report vulnerable library versions, and Semgrep CE follows untrusted input only within a single function. The `dataflow` scanner (`whitebox_dataflow.py`) reports request input that reaches a dangerous sink through calls between functions and files. It runs Semgrep CE taint mode in stages:
@@ -253,7 +269,7 @@ While the source is still extracted, each finding gets `fp_check`: a `verdict`, 
 | Verdict | When |
 | --- | --- |
 | `likely_false_positive` | The file is test code or a fixture, or an example, template, or documentation file. The finding's line has a suppression comment (`nosec`, `noqa`, `nosemgrep`, `gitleaks:allow`, `trivy:ignore`, `NOSONAR`, `pragma: allowlist secret`), or a comment line directly above it does. For secrets: the value looks like a placeholder or documentation example, or it is read from the environment or a template variable. |
-| `duplicate` | Another finding was reported first for the same package version and vulnerability, matching CVE, GHSA, and PYSEC IDs through their aliases. A secret at the same file and line also counts; Gitleaks and Trivy usually both report it. |
+| `duplicate` | Another finding was reported first for the same package version and vulnerability, matching CVE, GHSA, and PYSEC IDs through their aliases. A secret at the same file and line also counts; Gitleaks and Trivy usually both report it. A Semgrep (or Joern) match whose lines cover the sink of a `dataflow` finding with the same CWE or class is a duplicate of the traced finding, which is kept as the canonical one because it has the trace; the duplicate shares its evidence level and CVSS. |
 | `needs_review` | No signal. Findings in vendored or generated files keep this verdict, with a reason noting where they are. |
 
 On a project with three pinned Python dependencies, OSV-Scanner and Trivy together reported 170 dependency findings for 68 distinct vulnerabilities. The other 102 are marked `duplicate`. Source lines are read only to compute these checks and are not stored.
