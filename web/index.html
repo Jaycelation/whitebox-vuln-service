@@ -4,9 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0b1120">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'">
   <title>Whitebox · Scan Analysis</title>
+  <script src="/ui/theme.js"></script>
   <link rel="stylesheet" href="/ui/styles.css">
+  <link rel="stylesheet" href="/ui/theme.css">
   <script src="/ui/app.js" defer></script>
 </head>
 <body>
@@ -33,6 +36,7 @@
   </main>
 
   <div id="app-shell" class="app-shell hidden">
+    <a class="skip-link" href="#main-content">Chuyển đến nội dung</a>
     <aside class="sidebar">
       <a class="brand" href="/ui/" aria-label="Whitebox dashboard">
         <span class="brand-mark">✳</span>
@@ -72,7 +76,7 @@
         </div>
       </header>
 
-      <main class="content">
+      <main id="main-content" class="content">
         <div id="notice" class="notice hidden" role="status"></div>
         <section id="empty-state" class="empty-state">
           <div class="empty-icon">✳</div>

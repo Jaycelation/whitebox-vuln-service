@@ -1,0 +1,76 @@
+/* Shared interaction rules and the complete light palette. Loaded after styles.css. */
+:root { --focus-ring: #55dfd0; color-scheme: dark; }
+html[data-theme="light"] { --focus-ring: #087e78; color-scheme: light; }
+
+:where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+@media (min-width: 741px) {
+  .topbar { position: sticky; top: 0; z-index: 5; }
+  .findings-section, .report-editor { scroll-margin-top: 88px; }
+}
+button:disabled { cursor: not-allowed; }
+.mobile-finding-meta { display: none; }
+.skip-link { position: fixed; top: -80px; left: 16px; z-index: 20; padding: 10px 14px; border-radius: 7px; background: #48dacb; color: #08242a; font-size: 12px; font-weight: 700; }
+.skip-link:focus { top: 12px; }
+
+html[data-theme="light"] .auth-card { box-shadow: 0 20px 55px #1f38501c; }
+html[data-theme="light"] .sidebar-foot,
+html[data-theme="light"] .sidebar-foot #service-state,
+html[data-theme="light"] .side-heading,
+html[data-theme="light"] .brand small,
+html[data-theme="light"] .auth-brand small,
+html[data-theme="light"] .breadcrumbs,
+html[data-theme="light"] .top-actions>a,
+html[data-theme="light"] .scan-item small,
+html[data-theme="light"] .muted,
+html[data-theme="light"] .subtitle,
+html[data-theme="light"] .metric-label,
+html[data-theme="light"] .metric-foot,
+html[data-theme="light"] .panel-meta,
+html[data-theme="light"] .legend-item,
+html[data-theme="light"] .tool-row-head span,
+html[data-theme="light"] .section-head p:last-child,
+html[data-theme="light"] .search-wrap,
+html[data-theme="light"] .select-wrap,
+html[data-theme="light"] .finding-rule,
+html[data-theme="light"] .location,
+html[data-theme="light"] .row-arrow,
+html[data-theme="light"] td,
+html[data-theme="light"] .no-findings,
+html[data-theme="light"] .empty-state>p:last-child,
+html[data-theme="light"] .detail-section p,
+html[data-theme="light"] .detail-section code,
+html[data-theme="light"] .detail-section h3,
+html[data-theme="light"] .detail-kv dt,
+html[data-theme="light"] .auth-description,
+html[data-theme="light"] .auth-help,
+html[data-theme="light"] .reports-help { color: #52677f; }
+
+html[data-theme="light"] .icon-button { color: #365468; }
+html[data-theme="light"] .icon-button:hover,
+html[data-theme="light"] .icon-button:focus-visible { color: #087e78; background: #e7f5f1; }
+html[data-theme="light"] .detail-section a,
+html[data-theme="light"] .report-number,
+html[data-theme="light"] .plus { color: #087e78; }
+html[data-theme="light"] .empty-icon { color: #087e78; background: #e0f4ee; }
+html[data-theme="light"] .auth-docs:hover,
+html[data-theme="light"] .top-actions>a:hover { color: #087e78; }
+html[data-theme="light"] .metric-card:hover,
+html[data-theme="light"] .metric-card:focus-visible { border-color: #319c92; }
+html[data-theme="light"] .detail-backdrop { background: #14233880; }
+html[data-theme="light"] .detail-panel { box-shadow: -15px 0 40px #19314826; }
+html[data-theme="light"] .report-field-grid input::placeholder,
+html[data-theme="light"] #key-form input::placeholder { color: #6a7d91; }
+
+@media (max-width: 740px) {
+  .scan-list { scroll-snap-type: x proximity; }
+  .scan-item { scroll-snap-align: start; }
+  .mobile-finding-meta { display: block; margin-top: 7px; color: #91a5bb; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+  html[data-theme="light"] .mobile-finding-meta { color: #52677f; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

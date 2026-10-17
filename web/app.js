@@ -79,15 +79,6 @@ function lockScreen(message = "") {
   closeReportEditor();
   $("api-key").focus();
 }
-function applyTheme(theme) {
-  const active = theme === "light" ? "light" : "dark";
-  document.documentElement.dataset.theme = active;
-  document.querySelectorAll(".theme-toggle").forEach((button) => {
-    button.textContent = active === "light" ? "☾ Chế độ tối" : "☀ Chế độ sáng";
-  });
-  try { localStorage.setItem("whitebox-theme", active); } catch { /* Theme remains active for this page. */ }
-}
-
 async function loadScans({ quiet = false } = {}) {
   if (state.loading) return false;
   state.loading = true;
@@ -401,12 +392,13 @@ function renderFindings() {
     rule.prepend(node("span", `evidence-chip ${level}`, evidenceLabels[level] || level));
     if (finding.agent_review) rule.prepend(node("span", `agent-chip ${finding.agent_review.verdict}`, `Claude: ${agentLabels[finding.agent_review.verdict] || finding.agent_review.verdict}`));
     description.append(node("span", "finding-title", finding.title || "Potential issue"), rule);
+    description.append(node("span", "mobile-finding-meta", `${finding.path || "Unknown file"}${finding.line ? `:${finding.line}` : ""} · ${finding.tool || "unknown"}`));
     const locationCell = node("td");
     locationCell.append(node("span", "location", `${finding.path || "Unknown file"}${finding.line ? `:${finding.line}` : ""}`));
     const toolCell = node("td", "tool-name", finding.tool || "—");
     row.append(severity, description, locationCell, toolCell, node("td", "row-arrow", "↗"));
-    row.addEventListener("click", () => showDetail(finding));
-    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); showDetail(finding); } });
+    row.addEventListener("click", () => showDetail(finding, row));
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); showDetail(finding, row); } });
     body.append(row);
   }
   $("no-findings").classList.toggle("hidden", findings.length > 0);
@@ -418,7 +410,9 @@ function detailSection(parent, label, value, code = false) {
   section.append(node("h3", "", label), node(code ? "code" : "p", "", value || "—"));
   parent.append(section);
 }
-function showDetail(finding) {
+let detailTrigger = null;
+function showDetail(finding, trigger = document.activeElement) {
+  detailTrigger = trigger;
   const content = $("detail-content"); clear(content);
   content.append(node("h2", "detail-title", finding.title || "Potential issue"));
   const meta = node("div", "detail-meta");
@@ -532,8 +526,11 @@ function showDetail(finding) {
   $("detail-panel").focus();
 }
 function closeDetail() {
+  const wasOpen = !$("detail-panel").classList.contains("hidden");
   $("detail-backdrop").classList.add("hidden");
   $("detail-panel").classList.add("hidden");
+  if (wasOpen && detailTrigger?.isConnected) detailTrigger.focus();
+  detailTrigger = null;
 }
 
 $("key-form").addEventListener("submit", async (event) => {
@@ -549,9 +546,6 @@ $("key-form").addEventListener("submit", async (event) => {
   finally { button.disabled = false; button.textContent = "Vào dashboard →"; }
 });
 $("lock-session").addEventListener("click", () => lockScreen());
-document.querySelectorAll(".theme-toggle").forEach((button) => button.addEventListener("click", () => {
-  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
-}));
 $("refresh-scans").addEventListener("click", () => loadScans());
 $("finding-search").addEventListener("input", () => { state.shown = 40; renderFindings(); });
 $("severity-filter").addEventListener("change", () => { state.shown = 40; renderFindings(); });
@@ -646,7 +640,4 @@ window.addEventListener("hashchange", () => {
     state.selected = id; renderScanList(); loadSelectedReport();
   }
 });
-let savedTheme = "dark";
-try { savedTheme = localStorage.getItem("whitebox-theme") || "dark"; } catch { /* Storage can be disabled. */ }
-applyTheme(savedTheme);
 setInterval(() => { if (state.unlocked && state.scans.some((scan) => ["queued", "running"].includes(scan.status))) loadScans({ quiet: true }); }, 15000);
