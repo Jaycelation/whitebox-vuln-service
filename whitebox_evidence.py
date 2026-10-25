@@ -27,6 +27,8 @@ from typing import Any
 
 EVIDENCE_LEVELS = ("confirmed", "reachable", "present", "unverified", "false_positive")
 SCORED_LEVELS = frozenset({"confirmed", "reachable"})
+# How an agent decision names itself in the evidence items; anything else is Claude's own review.
+AGENT_LABELS = {"security-audit-skill": "A security-audit skill run"}
 
 # Typical vectors per vulnerability class, for an unauthenticated network attacker.
 CLASS_VECTORS = {
@@ -336,7 +338,8 @@ def apply_triage(finding: dict[str, Any]) -> None:
     evidence = finding.get("evidence") or {}
     automatic = evidence.get("automatic") or {"level": evidence.get("level", "present"), "items": evidence.get("items", []), "cvss": finding.get("cvss")}
     status = finding.get("triage_status", "needs_review")
-    who = "Claude (agent review)" if finding.get("triage_decided_by") == "agent" else "A reviewer"
+    who = AGENT_LABELS.get(finding.get("triage_source") or "", "Claude (agent review)") \
+        if finding.get("triage_decided_by") == "agent" else "A reviewer"
     if status == "false_positive":
         level, items, cvss = "false_positive", [f"{who} marked this finding as a false positive."], None
     elif status == "confirmed":

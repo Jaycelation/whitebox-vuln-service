@@ -99,7 +99,7 @@ Install the adapter from this repository with [uv](https://docs.astral.sh/uv/):
 uv tool install --editable .
 ```
 
-The package provides five MCP tools: `whitebox_list_scanners`, `whitebox_scan_repository`, `whitebox_scan_status`, `whitebox_get_report`, and `whitebox_triage_finding`. An agent can read a finding's `fp_check`, check the source itself, and record a false-positive or confirmed verdict with its evidence. `whitebox_scan_repository` defaults to Semgrep, Gitleaks, Trivy, and OSV-Scanner. Its `standard_plus_joern` profile adds Joern and requires `INSTALL_JOERN=1` in the service's `.env`, followed by an image rebuild. That profile runs the installed Joern query set; it does not add custom framework-specific source/sink models.
+The package provides seven MCP tools: `whitebox_list_scanners`, `whitebox_scan_repository`, `whitebox_scan_status`, `whitebox_get_report`, `whitebox_triage_finding`, `whitebox_audit_handoff`, and `whitebox_ingest_audit`. The last two are the [security-audit skill handoff](#security-audit-skill-handoff): `whitebox_audit_handoff` writes the scan's traced findings to `~/security-audit-skill/<project>/run-0-whitebox/`, and `whitebox_ingest_audit` records a finished run's verdicts. They are the only tools that write to the filesystem, and only inside `WHITEBOX_AUDIT_ROOT` (that directory by default). An agent can read a finding's `fp_check`, check the source itself, and record a false-positive or confirmed verdict with its evidence. `whitebox_scan_repository` defaults to Semgrep, Gitleaks, Trivy, and OSV-Scanner. Its `standard_plus_joern` profile adds Joern and requires `INSTALL_JOERN=1` in the service's `.env`, followed by an image rebuild. That profile runs the installed Joern query set; it does not add custom framework-specific source/sink models.
 
 ### Claude Code
 
@@ -141,6 +141,7 @@ Other endpoints:
 - `GET /api/scans?limit=50` lists recent jobs.
 - `GET /api/metrics` returns Prometheus text-format metrics: queue depth, stored scans by status, active scans and scanner processes, and scan and scanner run counts and durations. It uses the same bearer token as the other `/api` endpoints. Counts and durations cover the running process and reset when the service restarts.
 - `PATCH /api/scans/{id}/findings/{finding_id}` records a triage decision; see [Recording triage decisions](#recording-triage-decisions).
+- `GET /api/scans/{id}/report.findings.json` exports the traced findings in the security-audit skill's record format, and `POST /api/scans/{id}/audit` ingests a finished run's verdicts; see [Security-audit skill handoff](#security-audit-skill-handoff).
 - `DELETE /api/scans/{id}` removes a finished job and its report.
 - `GET /health` is an unauthenticated health check.
 
@@ -224,6 +225,69 @@ VERIFY_CONCURRENCY=3
 
 Then run `docker compose up -d`. The MCP adapter exposes the re-run as `whitebox_verify_scan`.
 
+### Security-audit skill handoff
+
+The scanners and Cloudflare's [security-audit skill](https://github.com/cloudflare/security-audit-skill)
+do different work. The scanners produce the same findings on every run but cannot reason about a
+trust boundary; the skill runs a six-phase agent audit that can, but has no scanner of its own. This
+phase is the round trip between them: the service hands over its traced findings as prior candidates,
+the skill audits the repository, and its verdicts come back as triage decisions.
+
+```sh
+# 1. Hand over: findings.json in the skill's record format
+curl -sS http://127.0.0.1:8000/api/scans/SCAN_ID/report.findings.json -o findings.json
+
+# 2. Run the audit (install the skill once: npx skills add \
+#    https://github.com/cloudflare/security-audit-skill --skill security-audit)
+
+# 3. Bring the run's verdicts back
+curl -sS -X POST http://127.0.0.1:8000/api/scans/SCAN_ID/audit \
+  -H 'Content-Type: application/json' \
+  -d "{\"records\": $(cat ~/security-audit-skill/my-project/run-1/findings.json)}"
+```
+
+Only findings with a source-to-sink trace are handed over; a dependency, secret, or pattern match
+has no trace and the skill's records require one. Trace steps are mapped to its vocabulary
+(`source` → `entrypoint`, `call` and `parameter` → `propagation`, `sink` → `sink`), each step
+carrying the function the analysis summarized or the file where it did not resolve one.
+
+| Finding | Record | Why |
+| --- | --- | --- |
+| Traced flow, any triage status | `needs_validation` | A static trace is not a demonstrated vulnerability. The skill's `confirmed` record requires a reproduction with an observed result, which no scanner can supply. |
+| Already triaged `false_positive` | `rejected` | The control that blocks the flow travels with it as the `reason`. |
+
+Each record's `blockers` say exactly what stopped short of proof: that the service never executed
+the flow, that validation written as a condition is not modelled, that a flow crossing helpers
+matched by name may not exist, and whatever the false-positive check or the service's own Claude
+review flagged. `validation_plan.local` names both ends of the trace and a payload shape for the
+class, so the run's sandbox work starts from something concrete.
+
+The service writes `findings.json` and a `whitebox-provenance.json` sidecar, and nothing else.
+`run-metadata.json`, `architecture.md`, and `coverage-ledger.json` belong to the run's parent agent,
+and the service ships no ledger: a scanner run is not a coverage claim over the surfaces it happened
+to touch. The provenance file says so, so a later run reads the records as priority input rather than
+as settled coverage.
+
+Coming back, records are matched to findings by `fingerprint` (`whitebox:` and the finding's match
+key, so it survives code moving to another line):
+
+- `confirmed` becomes a `confirmed` triage decision, `rejected` becomes `false_positive`, and both
+  carry to later scans of the project like any other decision.
+- `needs_validation` is stored on the finding as `audit_review` and changes no status.
+- A `confirmed` record with no observed result, and a `rejected` record with no reason, are
+  downgraded to `needs_validation` — the same rule the service applies to its own reviews.
+- A decision a person made is never overridden; those records are reported back as skipped.
+
+The report gains an `audit` summary, each reviewed finding gains `audit_review`, and the dashboard
+shows the verdict beside Claude's own review. `GET /api/scans/{id}/audit` returns the last ingested
+result, and `GET /api/scans/{id}/audit/handoff` returns both files at once for the MCP adapter.
+
+The skill needs Node.js, an agent with parallel sub-agents, and an OS-enforced sandbox before it will
+execute target code; without that sandbox its findings stay `needs_validation` too. This service's
+container is hardened for running scanners, not for running the code under review, so it is not that
+sandbox. The record format is checked against `third_party/security-audit-skill/report-schema.json`
+by the test suite, and CI runs the skill's own `validate-findings.cjs` against a generated export.
+
 ### False-positive checks
 
 While the source is still extracted, each finding gets `fp_check`: a `verdict`, the `reasons` for it, and `duplicate_of` when it repeats another finding. The check only advises. It never changes `triage_status` and never hides a finding.
@@ -276,4 +340,4 @@ python -m pip install -r requirements.txt -e .
 python -m unittest discover -s tests -v
 ```
 
-Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, the metrics endpoint, false-positive checks and triage, source-to-sink analysis, evidence levels and CVSS, and Claude review (with the Anthropic SDK against a mocked HTTP transport, never the real API). The dataflow tests run Semgrep when it is installed (CI installs it) and are skipped otherwise. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.
+Tests use temporary storage and mocked scanner execution; they do not invoke scanner binaries or scan external targets. They cover concurrent queue admission, cancellation during upload/extraction/scanning, restart recovery, result states, API upload validation, MCP archive limits, scan concurrency and per-tool process limits, report ordering under parallel scanning, pruning, stored scan summaries, the metrics endpoint, false-positive checks and triage, source-to-sink analysis, evidence levels and CVSS, Claude review (with the Anthropic SDK against a mocked HTTP transport, never the real API), and the security-audit skill handoff (export, record-format conformance, and ingest). The dataflow tests run Semgrep when it is installed (CI installs it) and are skipped otherwise. GitHub Actions runs the suite on Python 3.11, 3.12, and 3.13. Real scanner integration still requires the Docker image and installed scanners.

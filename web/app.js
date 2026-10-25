@@ -10,6 +10,7 @@ const evidenceLabels = {
 };
 function evidenceLevel(finding) { return finding.evidence?.level || "present"; }
 const agentLabels = { confirmed: "xác nhận", false_positive: "false positive", uncertain: "chưa đủ dữ liệu" };
+const auditLabels = { confirmed: "xác nhận", rejected: "bị phản bác", needs_validation: "chờ kiểm chứng" };
 const state = { key: "", scans: [], selected: null, report: null, shown: 40, loading: false, unlocked: false };
 
 function node(tag, className, content) {
@@ -290,6 +291,7 @@ function renderFindings() {
     const rule = node("span", "finding-rule", finding.rule_id || finding.category || "");
     rule.prepend(node("span", `evidence-chip ${level}`, evidenceLabels[level] || level));
     if (finding.agent_review) rule.prepend(node("span", `agent-chip ${finding.agent_review.verdict}`, `Claude: ${agentLabels[finding.agent_review.verdict] || finding.agent_review.verdict}`));
+    if (finding.audit_review) rule.prepend(node("span", `agent-chip ${finding.audit_review.verdict === "rejected" ? "false_positive" : finding.audit_review.verdict}`, `Audit: ${auditLabels[finding.audit_review.verdict] || finding.audit_review.verdict}`));
     description.append(node("span", "finding-title", finding.title || "Potential issue"), rule);
     const locationCell = node("td");
     locationCell.append(node("span", "location", `${finding.path || "Unknown file"}${finding.line ? `:${finding.line}` : ""}`));
@@ -371,6 +373,25 @@ function showDetail(finding) {
       box.append(details);
     }
     box.append(node("p", "agent-meta", `${review.model || "Claude"} · ${review.reviewed_at || ""}${finding.triage_decided_by === "manual" ? " · quyết định của reviewer được giữ nguyên" : ""}`));
+    content.append(box);
+  }
+  const audit = finding.audit_review;
+  if (audit) {
+    const box = node("section", "detail-section");
+    const verdictClass = audit.verdict === "rejected" ? "false_positive" : audit.verdict;
+    box.append(node("h3", "", `SECURITY-AUDIT SKILL · ${(auditLabels[audit.verdict] || audit.verdict).toUpperCase()}`));
+    box.append(node("p", `agent-summary ${verdictClass}`, audit.summary || audit.title || "—"));
+    if (audit.root_cause) box.append(node("p", "agent-detail", `Nguyên nhân gốc: ${audit.root_cause}`));
+    if (audit.observed_result) box.append(node("p", "agent-detail", `Kết quả quan sát được: ${audit.observed_result}`));
+    if (audit.reason) box.append(node("p", "agent-detail", `Lý do phản bác: ${audit.reason}`));
+    if (audit.remediation) box.append(node("p", "agent-detail", `Hướng sửa: ${audit.remediation}`));
+    if ((audit.blockers || []).length) {
+      const blockers = node("ul", "evidence-list");
+      for (const blocker of audit.blockers) blockers.append(node("li", "", blocker));
+      box.append(node("p", "agent-detail", "Vướng mắc khi kiểm chứng:"), blockers);
+    }
+    const severity = [audit.severity && `mức độ ${audit.severity}`, audit.confidence && `độ tin cậy ${audit.confidence}`].filter(Boolean).join(" · ");
+    box.append(node("p", "agent-meta", [`security-audit skill`, severity, audit.ingested_at].filter(Boolean).join(" · ")));
     content.append(box);
   }
   const windows = Array.isArray(finding.code_context) ? finding.code_context : [];

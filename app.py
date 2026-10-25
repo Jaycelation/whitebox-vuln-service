@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import whitebox_audit
 import whitebox_dataflow
 import whitebox_evidence
 import whitebox_verify
@@ -694,6 +695,7 @@ def parse_dataflow(data: Any, source_root: Path) -> list[dict[str, Any]]:
                 "kind": clean_text(step.get("kind"), 20),
                 "path": normalized_path(step.get("path"), source_root),
                 "line": line if isinstance(line, int) and line > 0 else None,
+                "scope": clean_text(step.get("scope"), 200),
                 "detail": clean_text(step.get("detail"), 300),
             })
         steps = " → ".join(f"{step['detail']} ({step['path']}:{step['line']})" for step in trace)
@@ -1718,6 +1720,13 @@ def get_report(
     return report
 
 
+class AuditIngest(BaseModel):
+    records: list[dict[str, Any]] = Field(
+        max_length=whitebox_audit.MAX_RECORDS,
+        description="The findings.json array from a finished security-audit skill run",
+    )
+
+
 class TriageUpdate(BaseModel):
     status: str = Field(description="One of: " + ", ".join(TRIAGE_STATUSES))
     note: str = Field("", max_length=2000, description="Why the finding has this status")
@@ -1836,11 +1845,81 @@ def triage_finding(scan_id: str, finding_id: str, update: TriageUpdate) -> dict[
     return {"finding": target, "updated": [finding["id"] for finding in group], "summary": report["summary"]}
 
 
+@api.post("/scans/{scan_id}/audit")
+def ingest_audit(scan_id: str, submission: AuditIngest) -> dict[str, Any]:
+    """Record the verdicts of a finished security-audit skill run as agent triage decisions.
+
+    The body is that run's findings.json. Records are matched to findings by fingerprint;
+    confirmed and rejected records become decisions, needs_validation records are stored on
+    the finding without changing its status, and a decision a person made is never touched.
+    """
+    records, errors = whitebox_audit.read_records(submission.records)
+    if not records:
+        raise HTTPException(status_code=422, detail={"message": "No usable records", "errors": errors[:20]})
+    with REPORT_WRITE_LOCK:
+        row, report = load_report(scan_id)
+        findings = report.get("findings") or []
+        by_fingerprint: dict[str, dict[str, Any]] = {}
+        for finding in findings:
+            by_fingerprint.setdefault(whitebox_audit.fingerprint(finding), finding)
+        now = utc_now()
+        applied: list[dict[str, Any]] = []
+        unmatched: list[str] = []
+        with connect_db() as db:
+            for item in records:
+                finding = by_fingerprint.get(str(item["fingerprint"]))
+                if finding is None:
+                    unmatched.append(str(item["fingerprint"]))
+                    continue
+                # A person's decision stands, as it does for the service's own review.
+                if finding.get("triage_decided_by") == "manual":
+                    errors.append(f"Record {item['fingerprint']} kept the reviewer's decision.")
+                    continue
+                if whitebox_audit.apply_record(finding, item, now):
+                    store_triage_decision(db, row["name"], finding.get("match_key") or finding_match_key(finding),
+                                          finding["triage_status"], finding["triage_note"], now, scan_id,
+                                          finding["id"], None, "agent")
+                applied.append(finding["audit_review"])
+        result = whitebox_audit.summary(applied, unmatched, errors)
+        report["audit"] = result
+        report.setdefault("summary", {}).update(triage_summary(findings))
+        report["summary"].update(whitebox_evidence.summary(findings))
+        directory = job_dir(scan_id)
+        temporary_report = directory / "report.json.tmp"
+        temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
+        temporary_report.replace(directory / "report.json")
+        update_scan(scan_id, summary_json=json.dumps(report["summary"]))
+    return {"audit": result, "summary": report["summary"]}
+
+
 @api.get("/scans/{scan_id}/report.sarif")
 def get_report_sarif(scan_id: str) -> JSONResponse:
     _, report = load_report(scan_id)
     sarif = findings_to_sarif(scan_id, report, report.get("findings") or [])
     return JSONResponse(content=sarif, media_type="application/sarif+json")
+
+
+@api.get("/scans/{scan_id}/report.findings.json")
+def get_report_findings(scan_id: str) -> JSONResponse:
+    """The traced findings as the security-audit skill's findings.json, as prior candidates."""
+    _, report = load_report(scan_id)
+    records = whitebox_audit.export(report.get("findings") or [])
+    return JSONResponse(content=records, media_type="application/json")
+
+
+@api.get("/scans/{scan_id}/audit/handoff")
+def get_audit_handoff(scan_id: str) -> dict[str, Any]:
+    """The files a security-audit skill run should be given: findings.json and its provenance."""
+    row, report = load_report(scan_id)
+    records = whitebox_audit.export(report.get("findings") or [])
+    return {"findings": records, "provenance": whitebox_audit.provenance(scan_id, row["name"], records)}
+
+
+@api.get("/scans/{scan_id}/audit")
+def get_audit(scan_id: str) -> dict[str, Any]:
+    """What a security-audit skill run recorded against this scan, if one has been ingested."""
+    _, report = load_report(scan_id)
+    return report.get("audit") or {"status": "none"}
 
 
 @api.delete("/scans/{scan_id}", status_code=204)

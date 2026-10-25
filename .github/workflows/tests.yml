@@ -19,3 +19,20 @@ jobs:
       # Semgrep runs the dataflow integration tests; same version as the Docker image.
       - run: python -m pip install "semgrep==1.179.0"
       - run: python -m unittest discover -s tests -v
+
+  audit-contract:
+    # The vendored schema is checked by the test suite; this runs the skill's own validator,
+    # which is the authoritative reading of its record format.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements.txt -e .
+      - run: git clone --depth 1 https://github.com/cloudflare/security-audit-skill "$RUNNER_TEMP/skill"
+      - run: DATA_DIR=$(mktemp -d) python tests/export_sample_findings.py "$RUNNER_TEMP/findings.json"
+      - run: node "$RUNNER_TEMP/skill/skills/security-audit/validate-findings.cjs" "$RUNNER_TEMP/findings.json"

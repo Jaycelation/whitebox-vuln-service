@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -17,6 +18,9 @@ API_KEY = os.getenv("WHITEBOX_API_KEY", "")
 MAX_SOURCE_BYTES = int(os.getenv("WHITEBOX_MAX_SOURCE_BYTES", str(1024 * 1024 * 1024)))
 MAX_ARCHIVE_BYTES = int(os.getenv("WHITEBOX_MAX_ARCHIVE_BYTES", str(200 * 1024 * 1024)))
 MAX_SOURCE_FILES = int(os.getenv("WHITEBOX_MAX_SOURCE_FILES", "20000"))
+# The only directory this adapter writes to: where the security-audit skill keeps its runs.
+AUDIT_ROOT = Path(os.getenv("WHITEBOX_AUDIT_ROOT", str(Path.home() / "security-audit-skill")))
+MAX_AUDIT_BYTES = int(os.getenv("WHITEBOX_MAX_AUDIT_BYTES", str(8 * 1024 * 1024)))
 DEFAULT_SCANNERS = ("semgrep", "dataflow", "gitleaks", "trivy", "osv-scanner")
 KNOWN_SCANNERS = frozenset((*DEFAULT_SCANNERS, "joern"))
 EXCLUDED_DIRECTORIES = frozenset(
@@ -320,6 +324,92 @@ async def whitebox_verify_scan(scan_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
         raise ValueError("Invalid scan ID")
     return await _api_request("POST", f"/api/scans/{scan_id}/verify")
+
+
+def _audit_directory(scan_id: str, project: str, output_directory: str | None) -> Path:
+    """A directory under AUDIT_ROOT; nothing else on the filesystem is writable from here."""
+    root = AUDIT_ROOT.expanduser().resolve()
+    if output_directory:
+        target = Path(output_directory).expanduser()
+        target = (Path.cwd() / target).resolve() if not target.is_absolute() else target.resolve()
+        if target != root and root not in target.parents:
+            raise ValueError(f"output_directory must be inside {root}; set WHITEBOX_AUDIT_ROOT to move it")
+        return target
+    # The skill numbers its own runs; this directory only carries the scanner's prior input.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", project or scan_id)[:60].strip("-") or scan_id
+    return root / safe / "run-0-whitebox"
+
+
+@mcp.tool()
+async def whitebox_audit_handoff(scan_id: str, output_directory: str | None = None, overwrite: bool = False) -> dict[str, Any]:
+    """Write the scan's traced findings where a security-audit skill run will read them.
+
+    Creates findings.json in the skill's record format, plus whitebox-provenance.json saying
+    where the records came from. Every record is needs_validation (or rejected for findings
+    already triaged as false positives): a static trace is not a demonstrated vulnerability.
+    The service writes no coverage-ledger.json, architecture.md, or run-metadata.json, which
+    belong to the run's parent agent.
+
+    Defaults to ~/security-audit-skill/<project>/run-0-whitebox. output_directory must be
+    inside that root (WHITEBOX_AUDIT_ROOT). Run the skill's audit afterwards, then send its
+    verdicts back with whitebox_ingest_audit.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
+        raise ValueError("Invalid scan ID")
+    status, handoff = await asyncio.gather(
+        _api_request("GET", f"/api/scans/{scan_id}"),
+        _api_request("GET", f"/api/scans/{scan_id}/audit/handoff"),
+    )
+    records = handoff["findings"]
+    if not records:
+        return {"written": False, "reason": "The scan has no finding with a source-to-sink trace to hand over.",
+                "scan_status": status.get("status")}
+    directory = _audit_directory(scan_id, str(status.get("name") or ""), output_directory)
+    findings_path = directory / "findings.json"
+    if findings_path.exists() and not overwrite:
+        raise ValueError(f"{findings_path} already exists; pass overwrite=True to replace it")
+    directory.mkdir(parents=True, exist_ok=True)
+    findings_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), "utf-8")
+    (directory / "whitebox-provenance.json").write_text(
+        json.dumps(handoff["provenance"], ensure_ascii=False, indent=2), "utf-8")
+    return {
+        "written": True,
+        "directory": str(directory),
+        "findings_path": str(findings_path),
+        "records": handoff["provenance"]["records"],
+        "next_step": ("Run the security-audit skill with this directory as prior input, then call "
+                      "whitebox_ingest_audit with the run's findings.json to record its verdicts."),
+    }
+
+
+@mcp.tool()
+async def whitebox_ingest_audit(scan_id: str, findings_path: str) -> dict[str, Any]:
+    """Record a finished security-audit skill run's verdicts against the scan's findings.
+
+    findings_path is that run's findings.json, inside WHITEBOX_AUDIT_ROOT. Records are matched
+    by fingerprint: confirmed and rejected records become agent triage decisions that carry to
+    later scans of the project, needs_validation records are stored on the finding without
+    changing its status, and a decision a person made is never overridden. A confirmed record
+    with no observed result, and a rejected record with no reason, are downgraded.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", scan_id):
+        raise ValueError("Invalid scan ID")
+    root = AUDIT_ROOT.expanduser().resolve()
+    path = Path(findings_path).expanduser()
+    path = (Path.cwd() / path).resolve() if not path.is_absolute() else path.resolve()
+    if root not in path.parents:
+        raise ValueError(f"findings_path must be inside {root}; set WHITEBOX_AUDIT_ROOT to move it")
+    if not path.is_file():
+        raise ValueError(f"{path} is not a file")
+    if path.stat().st_size > MAX_AUDIT_BYTES:
+        raise ValueError(f"{path} is larger than {MAX_AUDIT_BYTES} bytes")
+    try:
+        records = json.loads(path.read_text("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path} is not readable JSON: {exc}") from exc
+    if not isinstance(records, list):
+        raise ValueError("findings.json must be a JSON array of records")
+    return await _api_request("POST", f"/api/scans/{scan_id}/audit", json={"records": records})
 
 
 TRIAGE_STATUSES = frozenset({"needs_review", "confirmed", "false_positive", "accepted_risk", "fixed"})

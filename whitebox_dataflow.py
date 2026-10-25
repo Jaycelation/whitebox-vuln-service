@@ -740,6 +740,8 @@ def dedupe_flows(flows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def build_finding(flow: dict[str, Any], summaries: dict[str, Summary], locations: dict[str, list[tuple[int, str]]]) -> dict[str, Any]:
+    # Each step's `scope` is the function the analysis summarized, and the file where it did
+    # not resolve one; the audit export needs a scope for every step and must not guess.
     # The nearest source at or above the sink in the same file; direct sources win ties.
     candidates = [(line, key) for line, key in locations.get(flow["path"], []) if line <= flow["line"]]
     steps: list[dict[str, Any]] = []
@@ -749,23 +751,28 @@ def build_finding(flow: dict[str, Any], summaries: dict[str, Summary], locations
         wrapper = summaries.get(key)
         if wrapper is not None:
             via_wrapper = True
-            steps.append({"kind": "source", "path": wrapper.path, "line": wrapper.line, "detail": f"Request input returned by {wrapper.name}()"})
-            steps.append({"kind": "call", "path": flow["path"], "line": line, "detail": f"Result of {wrapper.name}() used here"})
+            steps.append({"kind": "source", "path": wrapper.path, "line": wrapper.line, "scope": f"{wrapper.name}()",
+                          "detail": f"Request input returned by {wrapper.name}()"})
+            steps.append({"kind": "call", "path": flow["path"], "line": line, "scope": flow["path"],
+                          "detail": f"Result of {wrapper.name}() used here"})
         else:
-            steps.append({"kind": "source", "path": flow["path"], "line": line, "detail": "Request input"})
+            steps.append({"kind": "source", "path": flow["path"], "line": line, "scope": flow["path"],
+                          "detail": "Request input"})
     hop = flow["hop"]
     seen: set[str] = set()
     current_path, current_line = flow["path"], flow["line"]
     while hop != "base" and hop in summaries and hop not in seen:
         seen.add(hop)
         summary = summaries[hop]
-        steps.append({"kind": "call", "path": current_path, "line": current_line, "detail": f"Passed to {summary.name}()"})
-        steps.append({"kind": "parameter", "path": summary.path, "line": summary.line,
+        steps.append({"kind": "call", "path": current_path, "line": current_line, "scope": current_path,
+                      "detail": f"Passed to {summary.name}()"})
+        steps.append({"kind": "parameter", "path": summary.path, "line": summary.line, "scope": f"{summary.name}()",
                       "detail": f"Parameter {summary.param} of {summary.name}() reaches the next step"})
         current_path, current_line = summary.path, summary.hop_line
         hop = summary.hop
     sink = VULN_CLASSES[flow["class"]]
-    steps.append({"kind": "sink", "path": current_path, "line": current_line, "detail": f"Used as {sink['sink']}"})
+    steps.append({"kind": "sink", "path": current_path, "line": current_line, "scope": current_path,
+                  "detail": f"Used as {sink['sink']}"})
     return {
         "language": flow["language"],
         "class": flow["class"],
